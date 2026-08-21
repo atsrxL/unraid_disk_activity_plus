@@ -1,31 +1,285 @@
 Menu="Buttons"
 ---
-<?PHP $v=@filemtime('/usr/local/emhttp/plugins/disk.activity/assets/disk-activity.css') ?: time(); ?>
+<?PHP
+// Button pages are included in the <head> of every Unraid WebGUI page. Emit
+// this plugin only for the exact Main route so a disk-column failure cannot
+// affect Dashboard, Settings, Plugins, or /Main/* detail pages.
+$requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH);
+if (rtrim($requestPath, '/') !== '/Main') return;
+
+$v = @filemtime('/usr/local/emhttp/plugins/disk.activity/assets/disk-activity.css') ?: time();
+?>
 <link type="text/css" rel="stylesheet" href="/plugins/disk.activity/assets/disk-activity.css?v=<?=$v?>">
 <script>
-$(function(){
-  if(window.location.pathname.indexOf('/Main')!==0) return;
-  var data={},mode='bar',win='2s',COL=6;
-  function label(){return win==='10s'?'10S Activity':win==='1min'?'1MIN Activity':win==='5min'?'5MIN Activity':'Activity';}
-  function cls(p){return p>=90?'disk-activity-critical':p>=70?'disk-activity-high':p>=40?'disk-activity-medium':'disk-activity-low';}
-  function inner(p){
-    if(p===undefined||p===null)return '<span class="disk-activity-na">-</span>';
-    if(mode==='plain')return '<span class="disk-activity-pct">'+p+'%</span>';
-    if(mode==='color')return '<span class="disk-activity-pct '+cls(p)+'-text">'+p+'%</span>';
-    return '<div class="disk-activity-bar"><span class="disk-activity-fill '+cls(p)+'" style="width:'+p+'%"></span><span class="disk-activity-text">'+p+'%</span></div>';
+$(function() {
+  'use strict';
+
+  var INSTANCE_KEY = '__diskActivityPlugin';
+  var POLL_INTERVAL = 2000;
+  var REQUEST_TIMEOUT = 1500;
+  var ACTIVITY_COL = 6;
+  var data = {};
+  var displayMode = 'bar';
+  var windowMode = '2s';
+  var reinject = false;
+  var destroyed = false;
+  var pollTimer = null;
+  var initTimer = null;
+  var request = null;
+  var observer = null;
+  var initAttempts = 0;
+
+  if (window[INSTANCE_KEY] && typeof window[INSTANCE_KEY].destroy === 'function') {
+    window[INSTANCE_KEY].destroy(true);
   }
-  function diskName(row){var n=null;$(row).find('td:first a[href*="/Main/"]').each(function(){var m=($(this).attr('href')||'').match(/[?&]name=([^&]+)/);if(m){n=decodeURIComponent(m[1]);return false;}});return n;}
-  function insertHeaders(){
-    $('table.disk_status thead tr').each(function(){if($(this).find('.disk-activity-header').length)return;var cells=$(this).children('td');if(!cells.length)return;if(cells.length===1){var c=parseInt(cells.attr('colspan')||'0');if(c>=10)cells.attr('colspan',c+1);return;}var visual=0,done=false;cells.each(function(){if(done)return false;var c=$(this),s=parseInt(c.attr('colspan')||'1');if(visual+s===COL){$('<td class="disk-activity-header">'+label()+'</td>').insertAfter(c);done=true;return false;}if(visual<COL&&visual+s>COL){c.attr('colspan',s+1);done=true;return false;}visual+=s;});});
+
+  function targetBodies() {
+    return $('#array_devices, #boot_device, tbody[id^="pool_device"]');
   }
-  function injectBody(){
-    $('table.disk_status tbody tr').each(function(){if($(this).find('.disk-activity-cell').length)return;var cells=$(this).children('td');if(cells.length<6)return;var first=cells.first(),span=parseInt(first.attr('colspan')||'0');if(span>=10){first.attr('colspan',span+1);return;}if($(this).hasClass('pool_header')){if($(this).data('da'))return;cells.each(function(){var s=parseInt($(this).attr('colspan')||'1');if(s>=4){$(this).attr('colspan',s+1);return false;}});$(this).data('da',1);return;}var n=diskName(this),p=n?data[n]:undefined,visual=0,done=false;cells.each(function(){if(done)return false;var c=$(this),s=parseInt(c.attr('colspan')||'1');if(visual+s===COL){c.after('<td class="disk-activity-cell">'+inner(p)+'</td>');done=true;return false;}if(visual<COL&&visual+s>COL){c.attr('colspan',s+1);done=true;return false;}visual+=s;});});
+
+  function targetTables() {
+    return targetBodies().closest('table.disk_status');
   }
-  function update(){
-    $('table.disk_status tbody tr').each(function(){var cell=$(this).find('.disk-activity-cell');if(!cell.length)return;var n=diskName(this);if(!n||data[n]===undefined)return;cell.html(inner(data[n]));});
+
+  function headerLabel() {
+    if (windowMode === '10s') return '10S Activity';
+    if (windowMode === '1min') return '1MIN Activity';
+    if (windowMode === '5min') return '5MIN Activity';
+    return 'Activity';
   }
-  function process(){insertHeaders();injectBody();update();}
-  function fetch(){ $.getJSON('/plugins/disk.activity/include/DiskActivity.php',function(r){if(!r)return;if(r._config){var old=mode;mode=r._config.display||'bar';win=r._config.window||'2s';$('.disk-activity-header').text(label());if(old!==mode)$('.disk-activity-cell').remove();}var d={};Object.keys(r).forEach(function(k){if(k!=='_devices'&&k!=='_config')d[k]=r[k];});data=d;process();}); }
-  var obs=new MutationObserver(function(){process();});$('table.disk_status tbody').each(function(){obs.observe(this,{childList:true,subtree:true});});process();fetch();setInterval(fetch,2000);
+
+  function activityClass(pct) {
+    if (pct >= 90) return 'disk-activity-critical';
+    if (pct >= 70) return 'disk-activity-high';
+    if (pct >= 40) return 'disk-activity-medium';
+    return 'disk-activity-low';
+  }
+
+  function activityInner(pct) {
+    if (pct === undefined || pct === null) {
+      return '<span class="disk-activity-na">-</span>';
+    }
+    if (displayMode === 'plain') {
+      return '<span class="disk-activity-pct">' + pct + '%</span>';
+    }
+    if (displayMode === 'color') {
+      return '<span class="disk-activity-pct ' + activityClass(pct) + '-text">' + pct + '%</span>';
+    }
+    return '<div class="disk-activity-bar">' +
+      '<span class="disk-activity-fill ' + activityClass(pct) + '" style="width:' + pct + '%"></span>' +
+      '<span class="disk-activity-text">' + pct + '%</span></div>';
+  }
+
+  function diskName(row) {
+    var href = $(row).find('td:first a[href*="/Main/"]').first().attr('href');
+    if (!href) return null;
+    try {
+      return new URL(href, window.location.href).searchParams.get('name');
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function extendColspan($cell) {
+    if ($cell.hasClass('disk-activity-span')) return;
+    var span = parseInt($cell.attr('colspan') || '1', 10);
+    $cell
+      .attr('data-disk-activity-original-colspan', span)
+      .addClass('disk-activity-span')
+      .attr('colspan', span + 1);
+  }
+
+  function insertHeaders() {
+    targetTables().find('thead tr').each(function() {
+      var $row = $(this);
+      if ($row.find('.disk-activity-header, .disk-activity-span').length) return;
+
+      var $cells = $row.children('td');
+      if (!$cells.length) return;
+      if ($cells.length === 1) {
+        if (parseInt($cells.first().attr('colspan') || '0', 10) >= 10) {
+          extendColspan($cells.first());
+        }
+        return;
+      }
+
+      var visualCol = 0;
+      $cells.each(function() {
+        var $cell = $(this);
+        var span = parseInt($cell.attr('colspan') || '1', 10);
+        if (visualCol + span === ACTIVITY_COL) {
+          $('<td class="disk-activity-header"></td>').text(headerLabel()).insertAfter($cell);
+          return false;
+        }
+        if (visualCol < ACTIVITY_COL && visualCol + span > ACTIVITY_COL) {
+          extendColspan($cell);
+          return false;
+        }
+        visualCol += span;
+      });
+    });
+  }
+
+  function injectBody() {
+    targetBodies().find('tr').each(function() {
+      var $row = $(this);
+      if ($row.find('.disk-activity-cell, .disk-activity-span').length) return;
+
+      var $cells = $row.children('td');
+      if (!$cells.length) return;
+
+      var $first = $cells.first();
+      if (parseInt($first.attr('colspan') || '0', 10) >= 10) {
+        extendColspan($first);
+        return;
+      }
+
+      if ($row.hasClass('pool_header')) {
+        $cells.each(function() {
+          if (parseInt($(this).attr('colspan') || '1', 10) >= 4) {
+            extendColspan($(this));
+            return false;
+          }
+        });
+        return;
+      }
+
+      if ($cells.length < 6) return;
+      var name = diskName(this);
+      var pct = name ? data[name] : undefined;
+      var visualCol = 0;
+
+      $cells.each(function() {
+        var $cell = $(this);
+        var span = parseInt($cell.attr('colspan') || '1', 10);
+        if (visualCol + span === ACTIVITY_COL) {
+          $cell.after('<td class="disk-activity-cell">' + activityInner(pct) + '</td>');
+          return false;
+        }
+        if (visualCol < ACTIVITY_COL && visualCol + span > ACTIVITY_COL) {
+          extendColspan($cell);
+          return false;
+        }
+        visualCol += span;
+      });
+    });
+  }
+
+  function updateValues() {
+    targetBodies().find('tr').each(function() {
+      var $cell = $(this).find('.disk-activity-cell');
+      if (!$cell.length) return;
+
+      var name = diskName(this);
+      if (!name || data[name] === undefined) return;
+
+      var state = displayMode + ':' + data[name];
+      if ($cell.attr('data-disk-activity-state') === state) return;
+      $cell.html(activityInner(data[name])).attr('data-disk-activity-state', state);
+    });
+  }
+
+  function processTables() {
+    if (destroyed) return;
+    if (reinject) {
+      targetTables().find('.disk-activity-cell').remove();
+      reinject = false;
+    }
+    insertHeaders();
+    targetTables().find('.disk-activity-header').text(headerLabel());
+    injectBody();
+    updateValues();
+  }
+
+  function schedulePoll(delay) {
+    if (destroyed) return;
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(poll, delay);
+  }
+
+  function poll() {
+    if (destroyed) return;
+    if (document.hidden) {
+      schedulePoll(POLL_INTERVAL);
+      return;
+    }
+    if (request) return;
+
+    request = $.ajax({
+      url: '/plugins/disk.activity/include/DiskActivity.php',
+      dataType: 'json',
+      cache: false,
+      timeout: REQUEST_TIMEOUT
+    }).done(function(response) {
+      if (!response || typeof response !== 'object') return;
+
+      if (response._config) {
+        var newMode = response._config.display || 'bar';
+        if (newMode !== displayMode) reinject = true;
+        displayMode = newMode;
+        windowMode = response._config.window || '2s';
+      }
+
+      var nextData = {};
+      Object.keys(response).forEach(function(key) {
+        if (key !== '_devices' && key !== '_config') nextData[key] = response[key];
+      });
+      data = nextData;
+      processTables();
+    }).always(function() {
+      request = null;
+      schedulePoll(POLL_INTERVAL);
+    });
+  }
+
+  function restoreMarkup() {
+    var $tables = targetTables();
+    $tables.find('.disk-activity-header, .disk-activity-cell').remove();
+    $tables.find('.disk-activity-span').each(function() {
+      var $cell = $(this);
+      var original = $cell.attr('data-disk-activity-original-colspan');
+      if (original !== undefined) $cell.attr('colspan', original);
+      $cell.removeAttr('data-disk-activity-original-colspan').removeClass('disk-activity-span');
+    });
+  }
+
+  function destroy(removeMarkup) {
+    if (destroyed) return;
+    destroyed = true;
+    clearTimeout(pollTimer);
+    clearTimeout(initTimer);
+    if (observer) observer.disconnect();
+    if (request) request.abort();
+    request = null;
+    $(window).off('.diskActivity');
+    $(document).off('.diskActivity');
+    if (removeMarkup) restoreMarkup();
+  }
+
+  function start() {
+    if (destroyed) return;
+    if (!targetBodies().length) {
+      initAttempts++;
+      if (initAttempts < 40) initTimer = setTimeout(start, 250);
+      else destroy(false);
+      return;
+    }
+
+    observer = new MutationObserver(processTables);
+    targetBodies().each(function() {
+      // Only watch tbody row replacement. Plugin td/span changes are below
+      // this level and therefore cannot retrigger the observer.
+      observer.observe(this, {childList: true});
+    });
+    processTables();
+    poll();
+  }
+
+  window[INSTANCE_KEY] = {destroy: destroy};
+  $(window).on('pagehide.diskActivity beforeunload.diskActivity', function() { destroy(false); });
+  $(document).on('visibilitychange.diskActivity', function() {
+    if (!document.hidden && !request) schedulePoll(0);
+  });
+  start();
 });
 </script>

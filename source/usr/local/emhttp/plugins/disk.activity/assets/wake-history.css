@@ -18,6 +18,7 @@
 .wake-state-active { background:#ef6c00; color:white; }
 .wake-state-unknown { background:#616161; color:white; }
 .wake-confidence-high { background:#2e7d32; color:white; }
+.wake-confidence-medium { background:#ef6c00; color:white; }
 .wake-confidence-unknown { background:#616161; color:white; }
 .white-theme .wake-card, .azure-theme .wake-card, .gray-theme .wake-card { border-color:#ccc; }
 .white-theme .wake-status, .azure-theme .wake-status, .gray-theme .wake-status { background:#eee; color:#222; }

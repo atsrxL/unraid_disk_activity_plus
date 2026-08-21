@@ -3,6 +3,7 @@ $varroot = '/var/local/emhttp';
 $activityIni = "$varroot/disk_activity.ini";
 $disksIni = "$varroot/disks.ini";
 header('Content-Type: application/json');
+header('Cache-Control: no-store');
 $activity = file_exists($activityIni) ? (@parse_ini_file($activityIni) ?: []) : [];
 foreach ($activity as $dev => &$pct) $pct = max(0, min(100, intval($pct)));
 unset($pct);

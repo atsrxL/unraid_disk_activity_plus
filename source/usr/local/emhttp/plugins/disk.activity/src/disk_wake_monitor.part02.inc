@@ -58,7 +58,11 @@ static int load_map(void) {
         int exists = 0;
         for (int i = 0; i < d->mount_count; i++) if (!strcmp(d->mounts[i], mount)) exists = 1;
         if (!exists && d->mount_count < MAX_MOUNTS_PER_DEVICE) {
-            snprintf(d->mounts[d->mount_count++], STR_PATH, "%s", mount);
+            struct stat st;
+            int mount_idx = d->mount_count;
+            snprintf(d->mounts[mount_idx], STR_PATH, "%s", mount);
+            d->mount_dev_ids[mount_idx] = stat(mount, &st) == 0 ? st.st_dev : 0;
+            d->mount_count++;
             add_unique_mount(mount);
         }
     }

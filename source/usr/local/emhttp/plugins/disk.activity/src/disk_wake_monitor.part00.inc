@@ -2,7 +2,7 @@
 #include <sys/fanotify.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/poll.h>
+#include <poll.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -14,6 +14,7 @@
 #include <time.h>
 #include <limits.h>
 #include <ctype.h>
+#include <dirent.h>
 
 #ifndef O_LARGEFILE
 #define O_LARGEFILE 0
@@ -38,12 +39,17 @@ typedef struct {
     char comm[STR_SMALL];
     char exe[STR_MED];
     char path[STR_PATH];
+    char container_id[128];
+    char container[256];
+    char confidence[16];
+    char evidence[24];
 } candidate_t;
 
 typedef struct {
     char dev[64];
     char name[STR_SMALL];
     char mounts[MAX_MOUNTS_PER_DEVICE][STR_PATH];
+    dev_t mount_dev_ids[MAX_MOUNTS_PER_DEVICE];
     int mount_count;
     power_state_t state;
     int64_t standby_observed_ms;
@@ -69,7 +75,9 @@ static char cfg_file[STR_PATH] = "/boot/config/plugins/disk.activity/disk.activi
 static int poll_seconds = 10;
 static int tracking_enabled = 1;
 static int verbose = 0;
+static int trace_events = 0;
 static char wake_detector[24] = "auto";
+static char test_open_fds_dev[64] = "";
 
 static int find_device(const char *dev);
 

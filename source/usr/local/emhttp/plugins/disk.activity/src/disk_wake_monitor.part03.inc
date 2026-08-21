@@ -21,8 +21,10 @@ static void append_wake_event(device_t *d, int64_t detected_ms) {
     char container_id[128] = "", container[256] = "";
     candidate_t *c = &d->candidate;
     if (c->valid) {
-        get_container_id(c->pid, container_id, sizeof(container_id));
-        resolve_container_name(container_id, container, sizeof(container));
+        snprintf(container_id, sizeof(container_id), "%s", c->container_id);
+        snprintf(container, sizeof(container), "%s", c->container);
+        if (!container_id[0]) get_container_id(c->pid, container_id, sizeof(container_id));
+        if (!container[0]) resolve_container_name(container_id, container, sizeof(container));
     }
 
     FILE *fp = fopen(history_file, "a");
@@ -42,7 +44,8 @@ static void append_wake_event(device_t *d, int64_t detected_ms) {
     fputs("\",\"container\":\"", fp); json_escape(fp, container);
     fputs("\",\"event\":\"", fp); json_escape(fp, c->valid ? c->event : "UNKNOWN");
     fputs("\",\"path\":\"", fp); json_escape(fp, c->valid ? c->path : "");
-    fputs("\",\"confidence\":\"", fp); fputs(c->valid ? "high" : "unknown", fp);
+    fputs("\",\"confidence\":\"", fp); json_escape(fp, c->valid && c->confidence[0] ? c->confidence : "unknown");
+    fputs("\",\"evidence\":\"", fp); json_escape(fp, c->valid && c->evidence[0] ? c->evidence : "none");
     fputs("\"}\n", fp);
     fclose(fp);
     d->last_wake_ms = detected_ms;

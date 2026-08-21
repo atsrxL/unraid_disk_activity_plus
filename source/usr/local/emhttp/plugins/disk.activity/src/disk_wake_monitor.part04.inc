@@ -13,15 +13,18 @@ static int setup_fanotify(void) {
     uint64_t mask = FAN_OPEN | FAN_ACCESS | FAN_MODIFY | FAN_CLOSE_WRITE | FAN_CLOSE_NOWRITE | FAN_OPEN_EXEC;
     int marks = 0;
     for (int i = 0; i < unique_mount_count; i++) {
-        int rc = -1;
+        int fs_rc = -1;
 #ifdef FAN_MARK_FILESYSTEM
-        rc = fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, mask, AT_FDCWD, unique_mounts[i]);
+        fs_rc = fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, mask, AT_FDCWD, unique_mounts[i]);
 #endif
-        if (rc != 0)
-            rc = fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_MOUNT, mask, AT_FDCWD, unique_mounts[i]);
-        if (rc == 0) {
+        // Some filesystems accept FAN_MARK_FILESYSTEM but do not emit events
+        // for bind-mounted container access. Add a mount mark as well; duplicate
+        // notifications are harmless because only the newest candidate is kept.
+        int mount_rc = fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_MOUNT, mask, AT_FDCWD, unique_mounts[i]);
+        if (fs_rc == 0 || mount_rc == 0) {
             marks++;
-            if (verbose) fprintf(stderr, "watch filesystem %s\n", unique_mounts[i]);
+            if (verbose) fprintf(stderr, "watch filesystem %s fs=%s mount=%s\n", unique_mounts[i],
+                                 fs_rc == 0 ? "yes" : "no", mount_rc == 0 ? "yes" : "no");
         } else if (verbose) {
             fprintf(stderr, "cannot watch %s: %s\n", unique_mounts[i], strerror(errno));
         }
@@ -63,7 +66,7 @@ static void process_fanotify(int fanfd) {
 }
 
 static void usage(const char *argv0) {
-    fprintf(stderr, "Usage: %s [--map FILE] [--history FILE] [--state FILE] [--config FILE] [--verbose]\n", argv0);
+    fprintf(stderr, "Usage: %s [--map FILE] [--history FILE] [--state FILE] [--config FILE] [--verbose] [--trace-events] [--test-open-fds DEV]\n", argv0);
 }
 
 int main(int argc, char **argv) {
@@ -73,6 +76,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--state") && i + 1 < argc) snprintf(state_file, sizeof(state_file), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) snprintf(cfg_file, sizeof(cfg_file), "%s", argv[++i]);
         else if (!strcmp(argv[i], "--verbose")) verbose = 1;
+        else if (!strcmp(argv[i], "--trace-events")) trace_events = 1;
+        else if (!strcmp(argv[i], "--test-open-fds") && i + 1 < argc) snprintf(test_open_fds_dev, sizeof(test_open_fds_dev), "%s", argv[++i]);
         else { usage(argv[0]); return 2; }
     }
 
@@ -82,6 +87,16 @@ int main(int argc, char **argv) {
 
     load_runtime_config();
     if (load_map() != 0) return 3;
+    if (test_open_fds_dev[0]) {
+        int idx = find_device(test_open_fds_dev);
+        if (idx < 0) return 5;
+        if (!capture_open_fd_candidate(&devices[idx], now_ms())) return 6;
+        candidate_t *c = &devices[idx].candidate;
+        resolve_container_name(c->container_id, c->container, sizeof(c->container));
+        fprintf(stdout, "pid=%d process=%s container_id=%s container=%s path=%s confidence=%s evidence=%s\n",
+                c->pid, c->comm, c->container_id, c->container, c->path, c->confidence, c->evidence);
+        return 0;
+    }
     int fanfd = setup_fanotify();
     if (fanfd < 0) return 4;
 

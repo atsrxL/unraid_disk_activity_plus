@@ -3,7 +3,7 @@
   <!ENTITY name      "disk.activity">
   <!ENTITY author    "atsrxL / DerekChan65535">
   <!ENTITY version   "2026.08.21">
-  <!ENTITY launch    "Settings/DiskActivitySettings">
+  <!ENTITY launch    "Main">
   <!ENTITY gitURL    "https://raw.githubusercontent.com/atsrxL/unraid_disk_activity_plus/main">
   <!ENTITY pluginURL "&gitURL;/disk.activity.plg">
   <!ENTITY txzURL    "https://github.com/atsrxL/unraid_disk_activity_plus/releases/download/v&version;/disk.activity-&version;.txz">
@@ -13,6 +13,13 @@
 <CHANGES>
 ###2026.08.21
 - Forked from DerekChan65535/unraid-disk-activity 2026.06.08
+- Fix /Main refresh freeze caused by a self-triggering MutationObserver loop
+- Isolate the activity UI to the exact Main route and prevent overlapping polls
+- Serialize wake-history polling and cancel requests when its page is hidden or closed
+- Fix quoted Unraid disk names and ZFS partition-to-physical-disk mapping
+- Add an open-file-descriptor attribution fallback for ZFS/container access
+- Restore the plugin launch target to Main so its primary display is discoverable
+- Keep the current cached package across reboots while cleaning older packages
 - Add HDD wake attribution with physical STANDBY → ACTIVE event tracking
 - Correlate fanotify userspace access with /proc/diskstats physical-I/O onset
 - Record PID, process, Docker/Podman container, operation and path when attribution is safe
@@ -43,8 +50,9 @@ if [ -e /proc/mdcmd ] && grep -q 'mdState=.*STARTED' /var/local/emhttp/var.ini 2
 fi
 cd /boot/config/plugins/disk.activity || exit 0
 shopt -s nullglob
+latest="$(printf '%s\n' disk.activity-*.txz | sort -V | tail -n 1)"
 for f in disk.activity-*.txz; do
-  [[ "$f" == "disk.activity-&version;.txz" ]] || rm -f "$f"
+  [[ "$f" == "$latest" ]] || rm -f "$f"
 done
 ]]></INLINE>
 </FILE>

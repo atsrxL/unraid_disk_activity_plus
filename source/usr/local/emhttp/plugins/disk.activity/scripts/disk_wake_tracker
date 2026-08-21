@@ -19,6 +19,7 @@ get_disk_map() {
   awk '
     /^\[/ {
       sec=$0; sub(/^\[/,"",sec); sub(/\]$/,"",sec)
+      gsub(/"/,"",sec)
     }
     /^device=/ {
       val=$0; sub(/^device=/,"",val); gsub(/"/,"",val)
@@ -28,7 +29,7 @@ get_disk_map() {
 }
 
 zpool_for_dev() {
-  local dev="$1" pool="" token real
+  local dev="$1" pool="" token real base parent
   command -v zpool >/dev/null 2>&1 || return 1
   while IFS= read -r line; do
     if [[ "$line" =~ ^[[:space:]]*pool:[[:space:]]+([^[:space:]]+) ]]; then
@@ -39,7 +40,9 @@ zpool_for_dev() {
     [[ "$token" == /dev/* ]] || continue
     real=$(readlink -f "$token" 2>/dev/null || true)
     [ -n "$real" ] || continue
-    if lsblk -sno NAME "$real" 2>/dev/null | grep -Fxq "$dev"; then
+    base="${real##*/}"
+    parent=$(lsblk -dnro PKNAME "$real" 2>/dev/null | head -n 1)
+    if [ "$base" = "$dev" ] || [ "$parent" = "$dev" ]; then
       echo "$pool"
       return 0
     fi

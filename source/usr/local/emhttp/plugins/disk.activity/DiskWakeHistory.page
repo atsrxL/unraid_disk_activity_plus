@@ -42,7 +42,7 @@ $v = @filemtime('/usr/local/emhttp/plugins/disk.activity/assets/wake-history.css
 </div>
 
 <h3>Wake event history</h3>
-<p class="wake-help">A <b>High</b> attribution means a file access from that PID was observed on the disk/pool after the drive was last confirmed in STANDBY and before it became ACTIVE. <b>Unknown</b> means the physical wake was detected but there was no safe userspace attribution; this can happen with metadata-only syscalls, ZFS/kernel I/O, controller activity, or accesses fanotify cannot see.</p>
+<p class="wake-help">A <b>High</b> attribution means fanotify observed a file access from that PID immediately before physical I/O. <b>Medium</b> means the process had a file or directory open on the same ZFS dataset at the physical-I/O onset; this fallback also resolves Docker cgroups and bind mounts. <b>Unknown</b> means the wake was detected but neither evidence source identified a userspace process.</p>
 <div class="wake-table-wrap">
 <table class="tablesorter wake-table" id="wake-events">
 <thead><tr>
@@ -54,6 +54,12 @@ $v = @filemtime('/usr/local/emhttp/plugins/disk.activity/assets/wake-history.css
 
 <script>
 $(function() {
+  var REFRESH_INTERVAL = 5000;
+  var REQUEST_TIMEOUT = 3000;
+  var refreshTimer = null;
+  var refreshRequest = null;
+  var stopped = false;
+
   function esc(v) { return $('<div>').text(v == null ? '' : String(v)).html(); }
   function when(ms) {
     if (!ms) return '-';
@@ -142,12 +148,52 @@ $(function() {
     $('#wake-events tbody').html(rows);
   }
 
-  function refresh() {
-    $.getJSON('/plugins/disk.activity/include/WakeHistory.php?limit=500')
-      .done(render)
-      .fail(function() { $('#wake-tracker-status').attr('class','wake-status wake-warn').text('Unable to read wake tracker API.'); });
+  function scheduleRefresh(delay) {
+    if (stopped) return;
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(refresh, delay);
   }
+
+  function refresh() {
+    if (stopped) return;
+    if (document.hidden) {
+      scheduleRefresh(REFRESH_INTERVAL);
+      return;
+    }
+    if (refreshRequest) return;
+
+    refreshRequest = $.ajax({
+      url: '/plugins/disk.activity/include/WakeHistory.php?limit=500',
+      dataType: 'json',
+      cache: false,
+      timeout: REQUEST_TIMEOUT
+    })
+      .done(render)
+      .fail(function(xhr, status) {
+        if (status !== 'abort') {
+          $('#wake-tracker-status').attr('class','wake-status wake-warn').text('Unable to read wake tracker API.');
+        }
+      })
+      .always(function() {
+        refreshRequest = null;
+        scheduleRefresh(REFRESH_INTERVAL);
+      });
+  }
+
+  function stopRefresh() {
+    if (stopped) return;
+    stopped = true;
+    clearTimeout(refreshTimer);
+    if (refreshRequest) refreshRequest.abort();
+    refreshRequest = null;
+    $(window).off('.diskWakeHistory');
+    $(document).off('.diskWakeHistory');
+  }
+
+  $(window).on('pagehide.diskWakeHistory beforeunload.diskWakeHistory', stopRefresh);
+  $(document).on('visibilitychange.diskWakeHistory', function() {
+    if (!document.hidden && !refreshRequest) scheduleRefresh(0);
+  });
   refresh();
-  setInterval(refresh, 5000);
 });
 </script>
