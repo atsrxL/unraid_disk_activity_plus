@@ -1,112 +1,140 @@
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
-        *eq++ = '\0';
-        trim(line); trim(eq);
-        if (*eq == '"') {
-            memmove(eq, eq + 1, strlen(eq));
-            char *q = strrchr(eq, '"'); if (q) *q = '\0';
-        }
-        if (!strcmp(line, "wake_tracking")) tracking_enabled = (!strcasecmp(eq, "yes") || !strcmp(eq, "1") || !strcasecmp(eq, "true"));
-        else if (!strcmp(line, "wake_poll")) {
-            int v = atoi(eq); if (v >= 2 && v <= 60) poll_seconds = v;
-        }
-        else if (!strcmp(line, "wake_verbose")) verbose = (!strcasecmp(eq, "yes") || !strcmp(eq, "1") || !strcasecmp(eq, "true"));
-        else if (!strcmp(line, "wake_detector")) {
-            if (!strcasecmp(eq, "auto") || !strcasecmp(eq, "unraid") || !strcasecmp(eq, "smartctl"))
-                snprintf(wake_detector, sizeof(wake_detector), "%s", eq);
+    for (int i = 0; i < device_count; i++) {
+        for (int m = 0; m < devices[i].mount_count; m++) {
+            if (path_matches_mount(path, devices[i].mounts[m])) return i;
         }
     }
-    fclose(fp);
-}
-
-static int find_device(const char *dev) {
-    for (int i = 0; i < device_count; i++) if (!strcmp(devices[i].dev, dev)) return i;
+    if (stp) {
+        for (int i = 0; i < device_count; i++) {
+            if (device_matches_dev_id(&devices[i], stp->st_dev)) return i;
+        }
+    }
     return -1;
 }
 
-static int add_unique_mount(const char *mount) {
-    for (int i = 0; i < unique_mount_count; i++) if (!strcmp(unique_mounts[i], mount)) return 0;
-    if (unique_mount_count >= MAX_UNIQUE_MOUNTS) return -1;
-    snprintf(unique_mounts[unique_mount_count++], STR_PATH, "%s", mount);
-    return 0;
+static const char *mask_name(uint64_t mask) {
+    if (mask & FAN_MODIFY) return "MODIFY";
+    if (mask & FAN_ACCESS) return "ACCESS";
+    if (mask & FAN_OPEN_EXEC) return "OPEN_EXEC";
+    if (mask & FAN_OPEN) return "OPEN";
+    if (mask & FAN_CLOSE_WRITE) return "CLOSE_WRITE";
+    if (mask & FAN_CLOSE_NOWRITE) return "CLOSE";
+    return "OTHER";
 }
 
-static int load_map(void) {
-    FILE *fp = fopen(map_file, "r");
-    if (!fp) {
-        fprintf(stderr, "cannot open map file %s: %s\n", map_file, strerror(errno));
-        return -1;
+static void clear_candidate(device_t *d) {
+    memset(&d->candidate, 0, sizeof(d->candidate));
+    d->ambiguous_count = 0;
+}
+
+static void clear_wake_window(device_t *d) {
+    memset(&d->recent_event, 0, sizeof(d->recent_event));
+    clear_candidate(d);
+    d->io_pending = 0;
+    d->io_onset_ms = 0;
+}
+
+static void capture_recent_event(device_t *d, pid_t pid, uint64_t mask, const char *path) {
+    if (!tracking_enabled || pid <= 0 || pid == getpid()) return;
+    int matches = 0;
+    for (int i = 0; i < d->mount_count; i++) {
+        if (path_matches_mount(path, d->mounts[i])) { matches = 1; break; }
     }
-    char line[STR_PATH + 512];
-    while (fgets(line, sizeof(line), fp)) {
-        trim(line);
-        if (!line[0] || line[0] == '#') continue;
-        char *dev = strtok(line, "\t");
-        char *name = strtok(NULL, "\t");
-        char *mount = strtok(NULL, "\t");
-        if (!dev || !name || !mount || mount[0] != '/') continue;
-        int idx = find_device(dev);
-        if (idx < 0) {
-            if (device_count >= MAX_DEVICES) break;
-            idx = device_count++;
-            memset(&devices[idx], 0, sizeof(devices[idx]));
-            snprintf(devices[idx].dev, sizeof(devices[idx].dev), "%s", dev);
-            snprintf(devices[idx].name, sizeof(devices[idx].name), "%s", name);
-            devices[idx].state = PWR_UNKNOWN;
-        }
-        device_t *d = &devices[idx];
-        int exists = 0;
-        for (int i = 0; i < d->mount_count; i++) if (!strcmp(d->mounts[i], mount)) exists = 1;
-        if (!exists && d->mount_count < MAX_MOUNTS_PER_DEVICE) {
+    if (!matches) return;
+    if (trace_events) {
+        fprintf(stderr, "fanotify %s/%s state=%s pid=%d event=%s path=%s\n",
+                d->name, d->dev, state_name(d->state), pid, mask_name(mask), path);
+    }
+    if (d->state != PWR_STANDBY || d->io_pending) return;
+
+    candidate_t *c = &d->recent_event;
+    memset(c, 0, sizeof(*c));
+    c->valid = 1;
+    c->ts_ms = now_ms();
+    c->pid = pid;
+    snprintf(c->event, sizeof(c->event), "%s", mask_name(mask));
+    snprintf(c->path, sizeof(c->path), "%s", path);
+    read_proc_text(pid, "comm", c->comm, sizeof(c->comm));
+    read_proc_exe(pid, c->exe, sizeof(c->exe));
+    get_container_id(pid, c->container_id, sizeof(c->container_id));
+    resolve_container_name(c->container_id, c->container, sizeof(c->container));
+    snprintf(c->confidence, sizeof(c->confidence), "high");
+    snprintf(c->evidence, sizeof(c->evidence), "fanotify");
+}
+
+static int capture_open_fd_candidate(device_t *d, int64_t t) {
+    if (!tracking_enabled) return 0;
+    DIR *proc = opendir("/proc");
+    if (!proc) return 0;
+
+    candidate_t unique;
+    memset(&unique, 0, sizeof(unique));
+    pid_t identities[MAX_OPEN_IDENTITIES];
+    int identity_count = 0;
+    struct dirent *pe;
+
+    while ((pe = readdir(proc)) != NULL) {
+        char *end = NULL;
+        long parsed = strtol(pe->d_name, &end, 10);
+        if (!pe->d_name[0] || !end || *end || parsed <= 0 || parsed > INT_MAX) continue;
+        pid_t pid = (pid_t)parsed;
+        if (pid == getpid()) continue;
+
+        char fd_dir_path[128];
+        snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", pid);
+        DIR *fd_dir = opendir(fd_dir_path);
+        if (!fd_dir) continue;
+        int matched_pid = 0;
+        candidate_t current;
+        memset(&current, 0, sizeof(current));
+
+        struct dirent *fe;
+        while ((fe = readdir(fd_dir)) != NULL) {
+            if (fe->d_name[0] == '.') continue;
+            char fd_path[160], target[STR_PATH];
+            snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%.31s", pid, fe->d_name);
+            ssize_t n = readlink(fd_path, target, sizeof(target) - 1);
+            if (n <= 0) continue;
+            target[n] = '\0';
             struct stat st;
-            int mount_idx = d->mount_count;
-            snprintf(d->mounts[mount_idx], STR_PATH, "%s", mount);
-            d->mount_dev_ids[mount_idx] = stat(mount, &st) == 0 ? st.st_dev : 0;
-            d->mount_count++;
-            add_unique_mount(mount);
-        }
-    }
-    fclose(fp);
-    return device_count ? 0 : -1;
-}
-
-static power_state_t query_unraid_power(const char *dev) {
-    FILE *fp = fopen("/var/local/emhttp/disks.ini", "r");
-    if (!fp) return PWR_UNKNOWN;
-    char line[1024], section_dev[64] = "", color[128] = "";
-    power_state_t result = PWR_UNKNOWN;
-
-    while (fgets(line, sizeof(line), fp)) {
-        trim(line);
-        if (line[0] == '[') {
-            if (!strcmp(section_dev, dev)) {
-                if (strstr(color, "blink")) result = PWR_STANDBY;
-                else if (strstr(color, "-on") || strstr(color, "green-on") || strstr(color, "yellow-on")) result = PWR_ACTIVE;
-                if (result != PWR_UNKNOWN) break;
+            if (stat(fd_path, &st) != 0) continue;
+            if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) continue;
+            if (!device_matches_dev_id(d, st.st_dev)) {
+                int prefix_match = 0;
+                for (int m = 0; m < d->mount_count; m++) {
+                    if (path_matches_mount(target, d->mounts[m])) { prefix_match = 1; break; }
+                }
+                if (!prefix_match) continue;
             }
-            section_dev[0] = color[0] = '\0';
-            continue;
-        }
-        if (!strncmp(line, "device=", 7)) {
-            snprintf(section_dev, sizeof(section_dev), "%.63s", line + 7);
-            trim(section_dev);
-            if (section_dev[0] == '"') memmove(section_dev, section_dev + 1, strlen(section_dev));
-            char *q = strrchr(section_dev, '"'); if (q) *q = '\0';
-        } else if (!strncmp(line, "color=", 6)) {
-            snprintf(color, sizeof(color), "%.127s", line + 6);
-            trim(color);
-            if (color[0] == '"') memmove(color, color + 1, strlen(color));
-            char *q = strrchr(color, '"'); if (q) *q = '\0';
-        }
-    }
-    if (result == PWR_UNKNOWN && !strcmp(section_dev, dev)) {
-        if (strstr(color, "blink")) result = PWR_STANDBY;
-        else if (strstr(color, "-on") || strstr(color, "green-on") || strstr(color, "yellow-on")) result = PWR_ACTIVE;
-    }
-    fclose(fp);
-    return result;
-}
 
-static power_state_t query_smartctl_power(const char *dev) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "LC_ALL=C smartctl -n standby -i /dev/%.63s 2>&1", dev);
+            current.valid = 1;
+            current.ts_ms = t;
+            current.pid = pid;
+            snprintf(current.event, sizeof(current.event), "OPEN_FD");
+            snprintf(current.path, sizeof(current.path), "%s", target);
+            read_proc_text(pid, "comm", current.comm, sizeof(current.comm));
+            read_proc_exe(pid, current.exe, sizeof(current.exe));
+            get_container_id(pid, current.container_id, sizeof(current.container_id));
+            resolve_container_name(current.container_id, current.container, sizeof(current.container));
+            snprintf(current.confidence, sizeof(current.confidence), "medium");
+            snprintf(current.evidence, sizeof(current.evidence), "open_fd_unique");
+            matched_pid = 1;
+            break;
+        }
+        closedir(fd_dir);
+
+        if (matched_pid) {
+            int seen = 0;
+            for (int i = 0; i < identity_count; i++) if (identities[i] == pid) { seen = 1; break; }
+            if (!seen && identity_count < MAX_OPEN_IDENTITIES) {
+                identities[identity_count++] = pid;
+                if (identity_count == 1) unique = current;
+                else if (identity_count > 1) unique.valid = 0;
+            }
+        }
+    }
+    closedir(proc);
+
+    if (identity_count == 1 && unique.valid) {
+        d->candidate = unique;
+        d->ambiguous_count = 0;
+        return 1;

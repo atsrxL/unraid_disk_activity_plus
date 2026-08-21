@@ -2,6 +2,11 @@ name: Publish Release
 on:
   create:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, e.g. 2026.08.21.1'
+        required: true
+        type: string
 permissions:
   contents: write
 jobs:
@@ -10,26 +15,44 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build plugin package
+        with:
+          ref: ${{ github.ref }}
+      - name: Resolve and validate version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            VERSION='${{ inputs.version }}'
+          else
+            VERSION="${GITHUB_REF_NAME#release/}"
+          fi
+          [[ "$VERSION" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}([.][0-9]+)?$ ]] || { echo "Invalid version: $VERSION" >&2; exit 1; }
+          PLG_VERSION=$(sed -n 's/.*<!ENTITY version[[:space:]]*"\([^"]*\)".*/\1/p' disk.activity.plg | head -n1)
+          [[ "$PLG_VERSION" == "$VERSION" ]] || { echo "disk.activity.plg version $PLG_VERSION does not match release $VERSION" >&2; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Build and validate plugin package
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y build-essential libc6-dev xz-utils
-          VERSION="${GITHUB_REF_NAME#release/}"
-          ./build.sh "$VERSION"
-      - name: Publish GitHub Release
+          sudo apt-get install -y build-essential libc6-dev xz-utils php-cli
+          ./build.sh '${{ steps.version.outputs.version }}'
+      - name: Publish immutable GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#release/}"
+          VERSION='${{ steps.version.outputs.version }}'
           TAG="v${VERSION}"
-          gh release view "$TAG" >/dev/null 2>&1 && exit 0
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; refusing to overwrite immutable assets." >&2
+            exit 1
+          fi
           gh release create "$TAG" \
             "build/disk.activity-${VERSION}.txz" \
             "build/disk.activity-${VERSION}.md5" \
             "build/disk.activity-${VERSION}.sha256" \
             --repo "$GITHUB_REPOSITORY" \
-            --target main \
+            --target "$GITHUB_SHA" \
             --title "Disk Activity Plus ${VERSION}" \
             --notes-file RELEASE_NOTES.md

@@ -1,6 +1,6 @@
 #!/bin/bash
-# Disk Activity Wake Tracker launcher/map generator
-# GPLv2
+# Disk Activity Plus - wake tracker launcher and monitored-filesystem map generator
+set -u
 
 PLUGIN=/usr/local/emhttp/plugins/disk.activity
 BIN="$PLUGIN/bin/disk_wake_monitor"
@@ -10,6 +10,7 @@ LOG=/var/log/disk_wake_monitor.log
 CFG=/boot/config/plugins/disk.activity/disk.activity.cfg
 HISTORY=/boot/config/plugins/disk.activity/wake-history.jsonl
 STATE=/var/local/emhttp/disk_wake_state.json
+OPENFILES=/var/local/emhttp/disk_open_files.json
 DISKS=/var/local/emhttp/disks.ini
 
 log() { echo "disk-wake: $*"; }
@@ -18,8 +19,7 @@ get_disk_map() {
   [ -s "$DISKS" ] || return 1
   awk '
     /^\[/ {
-      sec=$0; sub(/^\[/,"",sec); sub(/\]$/,"",sec)
-      gsub(/"/,"",sec)
+      sec=$0; sub(/^\[/,"",sec); sub(/\]$/,"",sec); gsub(/"/,"",sec)
     }
     /^device=/ {
       val=$0; sub(/^device=/,"",val); gsub(/"/,"",val)
@@ -51,27 +51,26 @@ zpool_for_dev() {
 }
 
 emit_zfs_mounts() {
-  local dev="$1" disk="$2" pool="$3" mp found=0
-  if command -v zfs >/dev/null 2>&1; then
-    while IFS= read -r mp; do
-      case "$mp" in
-        ""|none|legacy|-) continue ;;
-      esac
-      [[ "$mp" == /* ]] || continue
-      [ -d "$mp" ] || continue
-      printf '%s\t%s\t%s\n' "$dev" "$disk" "$mp"
-      found=1
-    done < <(zfs list -H -o mountpoint -r "$pool" 2>/dev/null)
-  fi
-  if [ "$found" -eq 0 ] && [ -d "/mnt/$pool" ]; then
+  local dev="$1" disk="$2" pool="$3" mounted mp found=0
+  command -v zfs >/dev/null 2>&1 || return 0
+  while IFS=$'\t' read -r mounted mp; do
+    [ "$mounted" = "yes" ] || continue
+    case "$mp" in ""|none|legacy|-) continue ;; esac
+    [[ "$mp" == /* ]] || continue
+    [ -d "$mp" ] || continue
+    mountpoint -q "$mp" 2>/dev/null || continue
+    printf '%s\t%s\t%s\n' "$dev" "$disk" "$mp"
+    found=1
+  done < <(zfs list -H -o mounted,mountpoint -r "$pool" 2>/dev/null)
+
+  if [ "$found" -eq 0 ] && [ -d "/mnt/$pool" ] && mountpoint -q "/mnt/$pool" 2>/dev/null; then
     printf '%s\t%s\t%s\n' "$dev" "$disk" "/mnt/$pool"
   fi
 }
 
 generate_map() {
-  local tmp="${MAP}.tmp.$$" dev disk pool mp count=0
+  local tmp="${MAP}.tmp.$$" dev disk pool mp
   : > "$tmp"
-
   while IFS=$'\t' read -r dev disk; do
     [ -b "/dev/$dev" ] || continue
     [ "$(cat "/sys/block/$dev/queue/rotational" 2>/dev/null)" = "1" ] || continue
@@ -79,23 +78,18 @@ generate_map() {
     mp="/mnt/$disk"
     if [ -d "$mp" ] && mountpoint -q "$mp" 2>/dev/null; then
       printf '%s\t%s\t%s\n' "$dev" "$disk" "$mp" >> "$tmp"
-      count=$((count + 1))
     fi
 
     pool=$(zpool_for_dev "$dev" 2>/dev/null || true)
-    if [ -n "$pool" ]; then
-      emit_zfs_mounts "$dev" "$disk" "$pool" >> "$tmp"
-      count=$((count + 1))
-    fi
+    [ -n "$pool" ] && emit_zfs_mounts "$dev" "$disk" "$pool" >> "$tmp"
   done < <(get_disk_map)
 
   awk '!seen[$0]++' "$tmp" > "$MAP"
   rm -f "$tmp"
-
-  [ -s "$MAP" ] || {
+  if [ ! -s "$MAP" ]; then
     log "no rotational mounted devices found; wake tracker not started"
     return 1
-  }
+  fi
   return 0
 }
 
@@ -104,18 +98,26 @@ start() {
     log "already running (PID $(cat "$PIDFILE"))"
     return 0
   fi
+  rm -f "$PIDFILE"
   [ -x "$BIN" ] || { log "monitor binary missing: $BIN"; return 1; }
   mkdir -p /var/local/emhttp /boot/config/plugins/disk.activity
   [ -e "$HISTORY" ] || : > "$HISTORY"
   generate_map || return 0
 
-  nohup "$BIN" --map "$MAP" --history "$HISTORY" --state "$STATE" --config "$CFG" >>"$LOG" 2>&1 &
+  nohup "$BIN" --map "$MAP" --history "$HISTORY" --state "$STATE" --open-files "$OPENFILES" --config "$CFG" >>"$LOG" 2>&1 &
   echo $! > "$PIDFILE"
+  sleep 0.05
+  if ! kill -0 "$!" 2>/dev/null; then
+    rm -f "$PIDFILE"
+    log "monitor failed to start; see $LOG"
+    return 1
+  fi
   log "started (PID $!)"
 }
 
 stop() {
   if [ -s "$PIDFILE" ]; then
+    local pid
     pid=$(cat "$PIDFILE")
     if kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
@@ -123,7 +125,7 @@ stop() {
       kill -9 "$pid" 2>/dev/null || true
     fi
   fi
-  rm -f "$PIDFILE" "$STATE" "$MAP"
+  rm -f "$PIDFILE" "$STATE" "$MAP" "$OPENFILES"
 }
 
 status() {
@@ -135,7 +137,7 @@ status() {
   fi
 }
 
-case "$1" in
+case "${1:-}" in
   start) start ;;
   stop) stop ;;
   restart) stop; sleep 0.2; start ;;

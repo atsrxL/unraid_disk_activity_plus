@@ -1,13 +1,24 @@
-## Disk Activity Plus 2026.08.21
+## Disk Activity Plus 2026.08.21.1
 
-First Plus release based on upstream Disk Activity 2026.06.08.
+This release turns the wake-attribution prototype into a safer long-running Unraid utility.
 
-### New
-- HDD wake attribution with STANDBY → ACTIVE event history.
-- PID/process/container/path correlation.
-- ZFS physical-device to dataset mapping.
-- 24h / 7d wake statistics and wake-source percentages.
-- Conservative HIGH/UNKNOWN attribution.
+### UI
+- Single **Settings → User Utilities → Disk Activity Plus** entry with two tabs: **Activity / Open Files** and **Wake History**.
+- Native sortable Dashboard tile showing files currently open on monitored HDD pools.
+- Reset button for wake statistics/history.
 
-### Notes
-This fork uses the same internal plugin name (`disk.activity`) as upstream and is intended to replace the original plugin, not run alongside it.
+### Attribution and reliability
+- HIGH is reserved for fanotify access immediately preceding physical disk I/O.
+- MEDIUM is emitted only when exactly one process has a matching open descriptor at I/O onset.
+- Multiple plausible open-FD processes stay UNKNOWN/ambiguous and do not pollute named source percentages.
+- Docker/Podman names are retained and current open files are generated from `/proc` into RAM.
+- ZFS mapping now ignores datasets that are not actually mounted.
+
+### Long-running behavior
+- Wake history is bounded by age and maximum event count.
+- Wake-history API caches unchanged results in RAM instead of reparsing persistent history every poll.
+- Dashboard and open-file pages only read RAM snapshots; they do not scan the file tree.
+
+### Release safety
+- Release builds validate PHP, shell and C source.
+- Releases are immutable and tags point at the exact commit that was built.

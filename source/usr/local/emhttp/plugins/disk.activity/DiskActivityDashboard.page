@@ -1,0 +1,54 @@
+Menu="Dashboard:95"
+Cond="version_compare(parse_ini_file('/etc/unraid-version')['version'],'7.0.0','>=')"
+---
+<?php
+$slug = 'disk.activity';
+$mytiles[$slug]['column1'] = <<<'HTML'
+<tbody class="sortable" title="Disk Activity Plus - Open Files">
+  <tr><td>
+    <span class="tile-header">
+      <span class="tile-header-left">
+        <i class="fa fa-folder-open-o fa-2x" style="width:36px;text-align:center;vertical-align:middle;"></i>
+        <div class="section">
+          <h3 class="tile-header-main">Open Files on HDD</h3>
+          <span><span id="dap-open-count">0</span> currently open</span>
+        </div>
+      </span>
+      <span class="tile-header-right"><span class="tile-header-right-controls">
+        <a href="/Settings/DiskActivityPlus" title="Open Disk Activity Plus"><i class="fa fa-fw fa-external-link control"></i></a>
+      </span></span>
+    </span>
+  </td></tr>
+  <tr><td><div id="dap-open-body"><p class="dap-empty">Loading…</p></div></td></tr>
+</tbody>
+<style>
+#dap-open-body .dap-row{display:grid;grid-template-columns:minmax(80px,32%) minmax(0,1fr);gap:8px;padding:4px 2px;border-bottom:1px solid rgba(127,127,127,.18);align-items:center}
+#dap-open-body .dap-row:last-child{border-bottom:none}
+#dap-open-body .dap-source{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#dap-open-body .dap-path{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.9}
+#dap-open-body .dap-disk{font-size:.8em;opacity:.65;margin-left:4px}
+#dap-open-body .dap-empty{text-align:center;padding:8px 0;font-style:italic;opacity:.7}
+</style>
+<script>
+(function(){
+  'use strict';
+  var timer=null,request=null,stopped=false;
+  function esc(t){var d=document.createElement('div');d.textContent=t==null?'':String(t);return d.innerHTML;}
+  function actor(e){var c=(e.container||'').trim(),p=(e.process||'unknown').trim();return c?c+(p&&p!==c?' ('+p+')':''):p;}
+  function render(data){
+    var body=document.getElementById('dap-open-body'),count=document.getElementById('dap-open-count');if(!body)return;
+    var files=Array.isArray(data&&data.files)?data.files:[];if(count)count.textContent=(data&&data.total!=null?data.total:files.length)+(data&&data.truncated?'+':'');
+    if(data&&data.enabled===false){body.innerHTML='<p class="dap-empty">Open-file snapshots disabled</p>';return;}
+    if(data&&data.stale){body.innerHTML='<p class="dap-empty">Snapshot stale — check Disk Activity Plus</p>';return;}
+    if(!files.length){body.innerHTML='<p class="dap-empty">No files currently open on monitored HDD pools</p>';return;}
+    body.innerHTML=files.map(function(e){return '<div class="dap-row"><div class="dap-source" title="PID '+esc(e.pid||'')+'">'+esc(actor(e))+'</div><div class="dap-path" title="'+esc(e.path||'')+'">'+esc(e.path||'-')+'<span class="dap-disk">'+esc(e.disk||e.device||'')+'</span></div></div>';}).join('');
+  }
+  function schedule(ms){if(!stopped){clearTimeout(timer);timer=setTimeout(poll,ms);}}
+  function poll(){if(stopped)return;if(document.hidden){schedule(5000);return;}if(request)return;request=fetch('/plugins/disk.activity/include/OpenFiles.php?limit=8',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(render).catch(function(){var b=document.getElementById('dap-open-body');if(b)b.innerHTML='<p class="dap-empty">Unable to read open-file snapshot</p>';}).finally(function(){request=null;schedule(5000);});}
+  window.addEventListener('pagehide',function(){stopped=true;clearTimeout(timer);});
+  document.addEventListener('visibilitychange',function(){if(!document.hidden&&!request)schedule(0);});
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',poll);else poll();
+})();
+</script>
+HTML;
+?>

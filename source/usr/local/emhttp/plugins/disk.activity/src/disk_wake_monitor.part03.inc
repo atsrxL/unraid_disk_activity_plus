@@ -1,101 +1,140 @@
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return PWR_UNKNOWN;
-    char out[8192]; size_t used = 0; out[0] = '\0';
-    while (used + 1 < sizeof(out) && fgets(out + used, (int)(sizeof(out) - used), fp)) used = strlen(out);
-    pclose(fp);
-    for (char *p = out; *p; p++) *p = (char)toupper((unsigned char)*p);
-    if (strstr(out, "STANDBY") || strstr(out, "SLEEP")) return PWR_STANDBY;
-    if (strstr(out, "ACTIVE") || strstr(out, "IDLE") || strstr(out, "START OF INFORMATION") || strstr(out, "DEVICE MODEL") || strstr(out, "PRODUCT:")) return PWR_ACTIVE;
-    return PWR_UNKNOWN;
+    }
+    d->ambiguous_count = identity_count;
+    return 0;
 }
 
-static power_state_t query_power(const char *dev) {
-    if (strcasecmp(wake_detector, "smartctl")) {
-        power_state_t s = query_unraid_power(dev);
-        if (s != PWR_UNKNOWN || !strcasecmp(wake_detector, "unraid")) return s;
-    }
-    return query_smartctl_power(dev);
-}
-
-static void append_wake_event(device_t *d, int64_t detected_ms) {
-    char container_id[128] = "", container[256] = "";
-    candidate_t *c = &d->candidate;
-    if (c->valid) {
-        snprintf(container_id, sizeof(container_id), "%s", c->container_id);
-        snprintf(container, sizeof(container), "%s", c->container);
-        if (!container_id[0]) get_container_id(c->pid, container_id, sizeof(container_id));
-        if (!container[0]) resolve_container_name(container_id, container, sizeof(container));
-    }
-
-    FILE *fp = fopen(history_file, "a");
-    if (!fp) {
-        fprintf(stderr, "cannot append history %s: %s\n", history_file, strerror(errno));
+static void observe_io_tick(device_t *d, uint64_t ticks, int64_t t) {
+    if (!d->io_initialized) {
+        d->prev_io_ticks = ticks;
+        d->io_initialized = 1;
         return;
     }
-    int64_t event_ts = c->valid ? c->ts_ms : (d->io_onset_ms ? d->io_onset_ms : detected_ms);
-    fprintf(fp, "{\"ts\":%lld,\"io_ts\":%lld,\"detected_ts\":%lld,\"device\":\"",
-            (long long)event_ts, (long long)d->io_onset_ms, (long long)detected_ms);
-    json_escape(fp, d->dev);
-    fputs("\",\"disk\":\"", fp); json_escape(fp, d->name);
-    fputs("\",\"pid\":", fp); fprintf(fp, "%d", c->valid ? c->pid : 0);
-    fputs(",\"process\":\"", fp); json_escape(fp, c->valid && c->comm[0] ? c->comm : "unknown");
-    fputs("\",\"exe\":\"", fp); json_escape(fp, c->valid ? c->exe : "");
-    fputs("\",\"container_id\":\"", fp); json_escape(fp, container_id);
-    fputs("\",\"container\":\"", fp); json_escape(fp, container);
-    fputs("\",\"event\":\"", fp); json_escape(fp, c->valid ? c->event : "UNKNOWN");
-    fputs("\",\"path\":\"", fp); json_escape(fp, c->valid ? c->path : "");
-    fputs("\",\"confidence\":\"", fp); json_escape(fp, c->valid && c->confidence[0] ? c->confidence : "unknown");
-    fputs("\",\"evidence\":\"", fp); json_escape(fp, c->valid && c->evidence[0] ? c->evidence : "none");
-    fputs("\"}\n", fp);
-    fclose(fp);
-    d->last_wake_ms = detected_ms;
-}
-
-static void write_state_snapshot(void) {
-    char tmp[STR_PATH + 16];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", state_file);
-    FILE *fp = fopen(tmp, "w");
-    if (!fp) return;
-    fprintf(fp, "{\"updated\":%lld,\"tracking\":%s,\"poll_seconds\":%d,\"detector\":\"", (long long)now_ms(), tracking_enabled ? "true" : "false", poll_seconds);
-    json_escape(fp, wake_detector);
-    fputs("\",\"devices\":[", fp);
-    for (int i = 0; i < device_count; i++) {
-        device_t *d = &devices[i];
-        if (i) fputc(',', fp);
-        fputs("{\"device\":\"", fp); json_escape(fp, d->dev);
-        fputs("\",\"disk\":\"", fp); json_escape(fp, d->name);
-        fputs("\",\"state\":\"", fp); fputs(state_name(d->state), fp);
-        fprintf(fp, "\",\"last_wake\":%lld,\"io_pending\":%s,\"io_ts\":%lld,\"candidate\":%s}",
-                (long long)d->last_wake_ms, d->io_pending ? "true" : "false",
-                (long long)d->io_onset_ms, d->candidate.valid ? "true" : "false");
-    }
-    fputs("]}\n", fp);
-    fclose(fp);
-    rename(tmp, state_file);
-}
-
-static void check_power_states(void) {
-    load_runtime_config();
-    int64_t t = now_ms();
-    for (int i = 0; i < device_count; i++) {
-        device_t *d = &devices[i];
-        power_state_t old = d->state;
-        power_state_t cur = query_power(d->dev);
-        if (cur == PWR_UNKNOWN) continue;
-        if (old == PWR_UNKNOWN) {
-            d->state = cur;
-            if (cur == PWR_STANDBY) {
-                d->standby_observed_ms = t;
-                clear_wake_window(d);
-            }
-            continue;
+    if (d->state == PWR_STANDBY && !d->io_pending && ticks > d->prev_io_ticks) {
+        d->io_pending = 1;
+        d->io_onset_ms = t;
+        clear_candidate(d);
+        if (d->recent_event.valid) {
+            int64_t age = t - d->recent_event.ts_ms;
+            if (age >= 0 && age <= PRE_IO_CORRELATION_MS) d->candidate = d->recent_event;
         }
-        if (old != cur) {
-            if (verbose) fprintf(stderr, "power %s/%s %s -> %s\n", d->name, d->dev, state_name(old), state_name(cur));
-            if (old == PWR_STANDBY && cur == PWR_ACTIVE) {
-                if (tracking_enabled) append_wake_event(d, t);
-                clear_wake_window(d);
-            } else if (cur == PWR_STANDBY) {
-                d->standby_observed_ms = t;
-                clear_wake_window(d);
-            }
+        if (tracking_enabled && !d->candidate.valid) capture_open_fd_candidate(d, t);
+        if (verbose) {
+            fprintf(stderr, "physical I/O onset %s/%s ticks=%llu candidate=%s ambiguous=%d\n",
+                    d->name, d->dev, (unsigned long long)ticks,
+                    d->candidate.valid ? d->candidate.comm : "unknown", d->ambiguous_count);
+        }
+    }
+    d->prev_io_ticks = ticks;
+}
+
+static void sample_diskstats(void) {
+    FILE *fp = fopen("/proc/diskstats", "r");
+    if (!fp) return;
+    char line[1024];
+    int64_t t = now_ms();
+    while (fgets(line, sizeof(line), fp)) {
+        char work[1024];
+        snprintf(work, sizeof(work), "%s", line);
+        char *save = NULL;
+        char *tok = strtok_r(work, " \t\n", &save);
+        int field = 0;
+        char dev[64] = "";
+        uint64_t ticks = 0;
+        int have_ticks = 0;
+        while (tok) {
+            if (field == 2) snprintf(dev, sizeof(dev), "%s", tok);
+            else if (field == 12) { ticks = strtoull(tok, NULL, 10); have_ticks = 1; break; }
+            field++;
+            tok = strtok_r(NULL, " \t\n", &save);
+        }
+        if (!have_ticks || !dev[0]) continue;
+        int idx = find_device(dev);
+        if (idx >= 0) observe_io_tick(&devices[idx], ticks, t);
+    }
+    fclose(fp);
+}
+
+static void load_runtime_config(void) {
+    FILE *fp = fopen(cfg_file, "r");
+    if (!fp) return;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq++ = '\0';
+        trim(line); trim(eq);
+        if (*eq == '"') {
+            memmove(eq, eq + 1, strlen(eq));
+            char *q = strrchr(eq, '"'); if (q) *q = '\0';
+        }
+        if (!strcmp(line, "wake_tracking")) tracking_enabled = (!strcasecmp(eq, "yes") || !strcmp(eq, "1") || !strcasecmp(eq, "true"));
+        else if (!strcmp(line, "wake_poll")) { int v = atoi(eq); if (v >= 2 && v <= 60) poll_seconds = v; }
+        else if (!strcmp(line, "wake_verbose")) verbose = (!strcasecmp(eq, "yes") || !strcmp(eq, "1") || !strcasecmp(eq, "true"));
+        else if (!strcmp(line, "open_files_dashboard")) open_files_enabled = (!strcasecmp(eq, "yes") || !strcmp(eq, "1") || !strcasecmp(eq, "true"));
+        else if (!strcmp(line, "open_files_limit")) { int v = atoi(eq); if (v >= 10 && v <= MAX_OPEN_FILES) open_files_limit = v; }
+        else if (!strcmp(line, "history_days")) { int v = atoi(eq); if (v >= 7 && v <= 3650) history_days = v; }
+        else if (!strcmp(line, "history_max")) { int v = atoi(eq); if (v >= 1000 && v <= 200000) history_max = v; }
+        else if (!strcmp(line, "wake_detector")) {
+            if (!strcasecmp(eq, "auto") || !strcasecmp(eq, "unraid") || !strcasecmp(eq, "smartctl")) snprintf(wake_detector, sizeof(wake_detector), "%s", eq);
+        }
+    }
+    fclose(fp);
+}
+
+static int find_device(const char *dev) {
+    for (int i = 0; i < device_count; i++) if (!strcmp(devices[i].dev, dev)) return i;
+    return -1;
+}
+
+static int add_unique_mount(const char *mount) {
+    for (int i = 0; i < unique_mount_count; i++) if (!strcmp(unique_mounts[i], mount)) return 0;
+    if (unique_mount_count >= MAX_UNIQUE_MOUNTS) return -1;
+    snprintf(unique_mounts[unique_mount_count++], STR_PATH, "%s", mount);
+    return 0;
+}
+
+static int load_map(void) {
+    FILE *fp = fopen(map_file, "r");
+    if (!fp) {
+        fprintf(stderr, "cannot open map file %s: %s\n", map_file, strerror(errno));
+        return -1;
+    }
+    char line[STR_PATH + 512];
+    while (fgets(line, sizeof(line), fp)) {
+        trim(line);
+        if (!line[0] || line[0] == '#') continue;
+        char *dev = strtok(line, "\t");
+        char *name = strtok(NULL, "\t");
+        char *mount = strtok(NULL, "\t");
+        if (!dev || !name || !mount || mount[0] != '/') continue;
+        int idx = find_device(dev);
+        if (idx < 0) {
+            if (device_count >= MAX_DEVICES) break;
+            idx = device_count++;
+            memset(&devices[idx], 0, sizeof(devices[idx]));
+            snprintf(devices[idx].dev, sizeof(devices[idx].dev), "%s", dev);
+            snprintf(devices[idx].name, sizeof(devices[idx].name), "%s", name);
+            devices[idx].state = PWR_UNKNOWN;
+        }
+        device_t *d = &devices[idx];
+        int exists = 0;
+        for (int i = 0; i < d->mount_count; i++) if (!strcmp(d->mounts[i], mount)) exists = 1;
+        if (!exists && d->mount_count < MAX_MOUNTS_PER_DEVICE) {
+            struct stat st;
+            int mount_idx = d->mount_count;
+            snprintf(d->mounts[mount_idx], STR_PATH, "%s", mount);
+            d->mount_dev_ids[mount_idx] = stat(mount, &st) == 0 ? st.st_dev : 0;
+            d->mount_count++;
+            add_unique_mount(mount);
+        }
+    }
+    fclose(fp);
+    return device_count ? 0 : -1;
+}
+
+static power_state_t query_unraid_power(const char *dev) {
+    FILE *fp = fopen("/var/local/emhttp/disks.ini", "r");
+    if (!fp) return PWR_UNKNOWN;
+    char line[1024], section_dev[64] = "", color[128] = "";
+    power_state_t result = PWR_UNKNOWN;
+    while (fgets(line, sizeof(line), fp)) {

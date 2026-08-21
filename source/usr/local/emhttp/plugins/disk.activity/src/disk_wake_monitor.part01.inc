@@ -1,9 +1,74 @@
+    char *p = s;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+}
+
+static void json_escape(FILE *f, const char *s) {
+    if (!s) return;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+            case '\\': fputs("\\\\", f); break;
+            case '"': fputs("\\\"", f); break;
+            case '\n': fputs("\\n", f); break;
+            case '\r': fputs("\\r", f); break;
+            case '\t': fputs("\\t", f); break;
+            default:
+                if (*p < 0x20) fprintf(f, "\\u%04x", *p);
+                else fputc(*p, f);
+        }
+    }
+}
+
+static void read_proc_text(pid_t pid, const char *leaf, char *out, size_t outsz) {
+    char path[128];
+    snprintf(path, sizeof(path), "/proc/%d/%s", pid, leaf);
+    FILE *fp = fopen(path, "r");
+    if (!fp) { out[0] = '\0'; return; }
+    if (!fgets(out, (int)outsz, fp)) out[0] = '\0';
+    fclose(fp);
+    trim(out);
+}
+
+static void read_proc_exe(pid_t pid, char *out, size_t outsz) {
+    char path[128];
+    snprintf(path, sizeof(path), "/proc/%d/exe", pid);
+    ssize_t n = readlink(path, out, outsz - 1);
+    if (n < 0) out[0] = '\0';
+    else out[n] = '\0';
+}
+
+static int extract_hex_id(const char *s, char *out, size_t outsz) {
+    size_t n = strlen(s);
+    for (size_t i = 0; i < n; i++) {
+        size_t j = i;
+        while (j < n && isxdigit((unsigned char)s[j])) j++;
+        size_t run = j - i;
+        if (run >= 64) {
+            size_t copy = 64;
+            if (copy >= outsz) copy = outsz - 1;
+            memcpy(out, s + i, copy);
+            out[copy] = '\0';
+            return 1;
+        }
+        if (j > i) i = j - 1;
+    }
+    return 0;
+}
+
+static void get_container_id(pid_t pid, char *out, size_t outsz) {
+    out[0] = '\0';
+    char path[128];
+    snprintf(path, sizeof(path), "/proc/%d/cgroup", pid);
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
         if (extract_hex_id(line, out, outsz)) break;
     }
     fclose(fp);
 }
 
-static void resolve_container_name(const char *id, char *out, size_t outsz) {
+static void resolve_container_name_uncached(const char *id, char *out, size_t outsz) {
     out[0] = '\0';
     if (!id || strlen(id) < 12) return;
     char cmd[512];
@@ -25,9 +90,26 @@ static void resolve_container_name(const char *id, char *out, size_t outsz) {
     }
 }
 
+static void resolve_container_name(const char *id, char *out, size_t outsz) {
+    out[0] = '\0';
+    if (!id || !id[0]) return;
+    for (int i = 0; i < container_cache_count; i++) {
+        if (!strcmp(container_cache[i].id, id)) {
+            snprintf(out, outsz, "%s", container_cache[i].name);
+            return;
+        }
+    }
+    resolve_container_name_uncached(id, out, outsz);
+    if (container_cache_count < (int)(sizeof(container_cache) / sizeof(container_cache[0]))) {
+        snprintf(container_cache[container_cache_count].id, sizeof(container_cache[container_cache_count].id), "%s", id);
+        snprintf(container_cache[container_cache_count].name, sizeof(container_cache[container_cache_count].name), "%s", out);
+        container_cache_count++;
+    }
+}
+
 static int path_matches_mount(const char *path, const char *mount) {
     size_t n = strlen(mount);
-    if (strncmp(path, mount, n) != 0) return 0;
+    if (!n || strncmp(path, mount, n) != 0) return 0;
     return path[n] == '\0' || path[n] == '/';
 }
 
@@ -38,187 +120,21 @@ static int device_matches_dev_id(const device_t *d, dev_t dev_id) {
     return 0;
 }
 
-static const char *mask_name(uint64_t mask) {
-    if (mask & FAN_MODIFY) return "MODIFY";
-    if (mask & FAN_ACCESS) return "ACCESS";
-    if (mask & FAN_OPEN_EXEC) return "OPEN_EXEC";
-    if (mask & FAN_OPEN) return "OPEN";
-    if (mask & FAN_CLOSE_WRITE) return "CLOSE_WRITE";
-    if (mask & FAN_CLOSE_NOWRITE) return "CLOSE";
-    return "OTHER";
-}
-
-static void clear_candidate(device_t *d) {
-    memset(&d->candidate, 0, sizeof(d->candidate));
-}
-
-static void clear_wake_window(device_t *d) {
-    memset(&d->recent_event, 0, sizeof(d->recent_event));
-    clear_candidate(d);
-    d->io_pending = 0;
-    d->io_onset_ms = 0;
-}
-
-static void capture_recent_event(device_t *d, pid_t pid, uint64_t mask, const char *path) {
-    if (!tracking_enabled) return;
-    if (pid <= 0 || pid == getpid()) return;
-
-    int matches = 0;
+static void logical_label_for_device(const device_t *d, char *out, size_t outsz) {
+    out[0] = '\0';
     for (int i = 0; i < d->mount_count; i++) {
-        if (path_matches_mount(path, d->mounts[i])) { matches = 1; break; }
-    }
-    if (!matches) return;
-
-    if (trace_events) {
-        fprintf(stderr, "fanotify %s/%s state=%s pid=%d event=%s path=%s\n",
-                d->name, d->dev, state_name(d->state), pid, mask_name(mask), path);
-    }
-    if (d->state != PWR_STANDBY || d->io_pending) return;
-
-    candidate_t *c = &d->recent_event;
-    memset(c, 0, sizeof(*c));
-    c->valid = 1;
-    c->ts_ms = now_ms();
-    c->pid = pid;
-    snprintf(c->event, sizeof(c->event), "%s", mask_name(mask));
-    snprintf(c->path, sizeof(c->path), "%s", path);
-    read_proc_text(pid, "comm", c->comm, sizeof(c->comm));
-    read_proc_exe(pid, c->exe, sizeof(c->exe));
-    get_container_id(pid, c->container_id, sizeof(c->container_id));
-    snprintf(c->confidence, sizeof(c->confidence), "high");
-    snprintf(c->evidence, sizeof(c->evidence), "fanotify");
-
-    if (verbose) {
-        fprintf(stderr, "recent %s/%s pid=%d %s %s\n", d->name, d->dev, pid, c->comm, c->path);
-    }
-}
-
-static int capture_open_fd_candidate(device_t *d, int64_t t) {
-    DIR *proc = opendir("/proc");
-    if (!proc) return 0;
-
-    candidate_t best;
-    memset(&best, 0, sizeof(best));
-    int best_score = -1;
-    struct dirent *pe;
-
-    while ((pe = readdir(proc)) != NULL) {
-        char *end = NULL;
-        long parsed = strtol(pe->d_name, &end, 10);
-        if (!pe->d_name[0] || !end || *end || parsed <= 0 || parsed > INT_MAX) continue;
-        pid_t pid = (pid_t)parsed;
-        if (pid == getpid()) continue;
-
-        char fd_dir_path[128];
-        snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", pid);
-        DIR *fd_dir = opendir(fd_dir_path);
-        if (!fd_dir) continue;
-
-        struct dirent *fe;
-        while ((fe = readdir(fd_dir)) != NULL) {
-            if (fe->d_name[0] == '.') continue;
-            char fd_path[160];
-            snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%.31s", pid, fe->d_name);
-
-            struct stat st;
-            if (stat(fd_path, &st) != 0 || !device_matches_dev_id(d, st.st_dev)) continue;
-
-            candidate_t current;
-            memset(&current, 0, sizeof(current));
-            current.valid = 1;
-            current.ts_ms = t;
-            current.pid = pid;
-            snprintf(current.event, sizeof(current.event), "OPEN_FD");
-            ssize_t n = readlink(fd_path, current.path, sizeof(current.path) - 1);
-            if (n > 0) current.path[n] = '\0';
-            else current.path[0] = '\0';
-            read_proc_text(pid, "comm", current.comm, sizeof(current.comm));
-            read_proc_exe(pid, current.exe, sizeof(current.exe));
-            get_container_id(pid, current.container_id, sizeof(current.container_id));
-            snprintf(current.confidence, sizeof(current.confidence), "medium");
-            snprintf(current.evidence, sizeof(current.evidence), "open_fd");
-
-            int score = current.container_id[0] ? 100 : 10;
-            if (S_ISREG(st.st_mode)) score += 5;
-            if (current.path[0]) score += 1;
-            if (score > best_score) {
-                best = current;
-                best_score = score;
-            }
-            // One matching descriptor is enough to identify this process.
-            break;
-        }
-        closedir(fd_dir);
-    }
-    closedir(proc);
-
-    if (best_score < 0) return 0;
-    d->candidate = best;
-    if (verbose) {
-        fprintf(stderr, "open-fd candidate %s/%s pid=%d process=%s container=%s path=%s\n",
-                d->name, d->dev, best.pid, best.comm,
-                best.container[0] ? best.container : "host", best.path);
-    }
-    return 1;
-}
-
-static void observe_io_tick(device_t *d, uint64_t ticks, int64_t t) {
-    if (!d->io_initialized) {
-        d->prev_io_ticks = ticks;
-        d->io_initialized = 1;
-        return;
-    }
-
-    if (d->state == PWR_STANDBY && !d->io_pending && ticks > d->prev_io_ticks) {
-        d->io_pending = 1;
-        d->io_onset_ms = t;
-        clear_candidate(d);
-        if (d->recent_event.valid) {
-            int64_t age = t - d->recent_event.ts_ms;
-            if (age >= 0 && age <= PRE_IO_CORRELATION_MS) {
-                d->candidate = d->recent_event;
-            }
-        }
-        if (!d->candidate.valid) capture_open_fd_candidate(d, t);
-        if (verbose) {
-            fprintf(stderr, "physical I/O onset %s/%s ticks=%llu candidate=%s age_ms=%lld\n",
-                    d->name, d->dev, (unsigned long long)ticks,
-                    d->candidate.valid ? d->candidate.comm : "unknown",
-                    (long long)(d->candidate.valid ? t - d->candidate.ts_ms : -1));
+        const char *m = d->mounts[i];
+        if (strncmp(m, "/mnt/", 5) != 0) continue;
+        const char *start = m + 5;
+        const char *slash = strchr(start, '/');
+        size_t n = slash ? (size_t)(slash - start) : strlen(start);
+        if (n > 0) {
+            if (n >= outsz) n = outsz - 1;
+            memcpy(out, start, n); out[n] = '\0';
+            return;
         }
     }
-    d->prev_io_ticks = ticks;
+    snprintf(out, outsz, "%s", d->name);
 }
 
-static void sample_diskstats(void) {
-    FILE *fp = fopen("/proc/diskstats", "r");
-    if (!fp) return;
-    char line[1024];
-    int64_t t = now_ms();
-    while (fgets(line, sizeof(line), fp)) {
-        char work[1024];
-        snprintf(work, sizeof(work), "%s", line);
-        char *save = NULL;
-        char *tok = strtok_r(work, " \t\n", &save);
-        int field = 0;
-        char dev[64] = "";
-        uint64_t ticks = 0;
-        int have_ticks = 0;
-        while (tok) {
-            if (field == 2) snprintf(dev, sizeof(dev), "%s", tok);
-            else if (field == 12) { ticks = strtoull(tok, NULL, 10); have_ticks = 1; break; }
-            field++;
-            tok = strtok_r(NULL, " \t\n", &save);
-        }
-        if (!have_ticks || !dev[0]) continue;
-        int idx = find_device(dev);
-        if (idx >= 0) observe_io_tick(&devices[idx], ticks, t);
-    }
-    fclose(fp);
-}
-
-static void load_runtime_config(void) {
-    FILE *fp = fopen(cfg_file, "r");
-    if (!fp) return;
-    char line[512];
-    while (fgets(line, sizeof(line), fp)) {
+static int find_device_for_path_or_stat(const char *path, const struct stat *stp) {
