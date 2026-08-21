@@ -1,0 +1,73 @@
+#!/bin/bash
+# Disk Activity daemon - computes block-device busy percentage from /proc/diskstats.
+INI=/var/local/emhttp/disk_activity.ini
+TMP=/var/local/emhttp/disk_activity.tmp
+PIDFILE=/var/run/disk_activity.pid
+CFG=/boot/config/plugins/disk.activity/disk.activity.cfg
+DEFAULT_CFG=/usr/local/emhttp/plugins/disk.activity/default.cfg
+INTERVAL=2
+INTERVAL_MS=2000
+MAX_SAMPLES=150
+
+echo $$ > "$PIDFILE"
+declare -A prev_ticks samples sample_count
+
+get_window_samples() {
+  local window="2s" val=""
+  if [ -f "$CFG" ]; then
+    val=$(grep -m1 '^window=' "$CFG" 2>/dev/null | cut -d'"' -f2)
+  elif [ -f "$DEFAULT_CFG" ]; then
+    val=$(grep -m1 '^window=' "$DEFAULT_CFG" 2>/dev/null | cut -d'"' -f2)
+  fi
+  [ -n "$val" ] && window="$val"
+  case "$window" in
+    10s) echo 5 ;;
+    1min) echo 30 ;;
+    5min) echo 150 ;;
+    *) echo 1 ;;
+  esac
+}
+
+compute_avg() {
+  local all="$1" count="$2" want="$3" use="$3" sum=0 n=0 v
+  [ "$count" -lt "$use" ] && use="$count"
+  while read -r v; do
+    [ -n "$v" ] || continue
+    sum=$((sum + v)); n=$((n + 1))
+  done < <(printf '%s\n' "$all" | tr ' ' '\n' | tail -n "$use")
+  [ "$n" -eq 0 ] && echo 0 || echo $((sum / n))
+}
+
+read_stats() {
+  awk '$3 ~ /^(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+)$/ {print $3, $13}' /proc/diskstats
+}
+
+while IFS=' ' read -r dev ticks; do
+  prev_ticks[$dev]=$ticks; samples[$dev]=""; sample_count[$dev]=0
+done < <(read_stats)
+
+sleep "$INTERVAL"
+while :; do
+  : > "$TMP"
+  win_samples=$(get_window_samples)
+  while IFS=' ' read -r dev ticks; do
+    prev=${prev_ticks[$dev]:-$ticks}
+    delta=$((ticks - prev))
+    if [ "$delta" -le 0 ]; then pct=0
+    elif [ "$delta" -ge "$INTERVAL_MS" ]; then pct=100
+    else pct=$((delta * 100 / INTERVAL_MS)); fi
+
+    c=${sample_count[$dev]:-0}
+    if [ "$c" -ge "$MAX_SAMPLES" ]; then
+      samples[$dev]="${samples[$dev]#* }"
+    else
+      sample_count[$dev]=$((c + 1))
+    fi
+    if [ -z "${samples[$dev]}" ]; then samples[$dev]="$pct"; else samples[$dev]="${samples[$dev]} $pct"; fi
+    avg=$(compute_avg "${samples[$dev]}" "${sample_count[$dev]}" "$win_samples")
+    printf '%s=%s\n' "$dev" "$avg" >> "$TMP"
+    prev_ticks[$dev]=$ticks
+  done < <(read_stats)
+  mv -f "$TMP" "$INI"
+  sleep "$INTERVAL"
+done

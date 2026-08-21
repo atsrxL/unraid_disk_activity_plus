@@ -1,0 +1,23 @@
+.wake-status { padding:10px 12px; margin:8px 0 14px; border-radius:3px; background:#333; }
+.wake-status.wake-ok { border-left:4px solid #4caf50; }
+.wake-status.wake-warn { border-left:4px solid #ff9800; }
+.wake-cards { display:flex; flex-wrap:wrap; gap:10px; margin:10px 0 18px; }
+.wake-card { min-width:160px; flex:1 1 180px; padding:12px 14px; border:1px solid #444; border-radius:4px; }
+.wake-card-value { font-size:24px; font-weight:600; line-height:1.2; }
+.wake-card-actor { font-size:18px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.wake-card-label { opacity:.7; margin-top:4px; font-size:12px; }
+.wake-table-wrap { overflow-x:auto; }
+.wake-table { width:100%; }
+.wake-table th, .wake-table td { vertical-align:middle; }
+.wake-dev { opacity:.65; font-size:11px; }
+.wake-nowrap { white-space:nowrap; }
+.wake-path { max-width:520px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-family:monospace; font-size:11px; }
+.wake-help { max-width:1100px; opacity:.8; }
+.wake-state, .wake-confidence { display:inline-block; padding:2px 7px; border-radius:10px; font-size:10px; font-weight:600; }
+.wake-state-standby { background:#2e7d32; color:white; }
+.wake-state-active { background:#ef6c00; color:white; }
+.wake-state-unknown { background:#616161; color:white; }
+.wake-confidence-high { background:#2e7d32; color:white; }
+.wake-confidence-unknown { background:#616161; color:white; }
+.white-theme .wake-card, .azure-theme .wake-card, .gray-theme .wake-card { border-color:#ccc; }
+.white-theme .wake-status, .azure-theme .wake-status, .gray-theme .wake-status { background:#eee; color:#222; }

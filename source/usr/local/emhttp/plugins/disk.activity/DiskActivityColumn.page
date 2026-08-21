@@ -1,0 +1,31 @@
+Menu="Buttons"
+---
+<?PHP $v=@filemtime('/usr/local/emhttp/plugins/disk.activity/assets/disk-activity.css') ?: time(); ?>
+<link type="text/css" rel="stylesheet" href="/plugins/disk.activity/assets/disk-activity.css?v=<?=$v?>">
+<script>
+$(function(){
+  if(window.location.pathname.indexOf('/Main')!==0) return;
+  var data={},mode='bar',win='2s',COL=6;
+  function label(){return win==='10s'?'10S Activity':win==='1min'?'1MIN Activity':win==='5min'?'5MIN Activity':'Activity';}
+  function cls(p){return p>=90?'disk-activity-critical':p>=70?'disk-activity-high':p>=40?'disk-activity-medium':'disk-activity-low';}
+  function inner(p){
+    if(p===undefined||p===null)return '<span class="disk-activity-na">-</span>';
+    if(mode==='plain')return '<span class="disk-activity-pct">'+p+'%</span>';
+    if(mode==='color')return '<span class="disk-activity-pct '+cls(p)+'-text">'+p+'%</span>';
+    return '<div class="disk-activity-bar"><span class="disk-activity-fill '+cls(p)+'" style="width:'+p+'%"></span><span class="disk-activity-text">'+p+'%</span></div>';
+  }
+  function diskName(row){var n=null;$(row).find('td:first a[href*="/Main/"]').each(function(){var m=($(this).attr('href')||'').match(/[?&]name=([^&]+)/);if(m){n=decodeURIComponent(m[1]);return false;}});return n;}
+  function insertHeaders(){
+    $('table.disk_status thead tr').each(function(){if($(this).find('.disk-activity-header').length)return;var cells=$(this).children('td');if(!cells.length)return;if(cells.length===1){var c=parseInt(cells.attr('colspan')||'0');if(c>=10)cells.attr('colspan',c+1);return;}var visual=0,done=false;cells.each(function(){if(done)return false;var c=$(this),s=parseInt(c.attr('colspan')||'1');if(visual+s===COL){$('<td class="disk-activity-header">'+label()+'</td>').insertAfter(c);done=true;return false;}if(visual<COL&&visual+s>COL){c.attr('colspan',s+1);done=true;return false;}visual+=s;});});
+  }
+  function injectBody(){
+    $('table.disk_status tbody tr').each(function(){if($(this).find('.disk-activity-cell').length)return;var cells=$(this).children('td');if(cells.length<6)return;var first=cells.first(),span=parseInt(first.attr('colspan')||'0');if(span>=10){first.attr('colspan',span+1);return;}if($(this).hasClass('pool_header')){if($(this).data('da'))return;cells.each(function(){var s=parseInt($(this).attr('colspan')||'1');if(s>=4){$(this).attr('colspan',s+1);return false;}});$(this).data('da',1);return;}var n=diskName(this),p=n?data[n]:undefined,visual=0,done=false;cells.each(function(){if(done)return false;var c=$(this),s=parseInt(c.attr('colspan')||'1');if(visual+s===COL){c.after('<td class="disk-activity-cell">'+inner(p)+'</td>');done=true;return false;}if(visual<COL&&visual+s>COL){c.attr('colspan',s+1);done=true;return false;}visual+=s;});});
+  }
+  function update(){
+    $('table.disk_status tbody tr').each(function(){var cell=$(this).find('.disk-activity-cell');if(!cell.length)return;var n=diskName(this);if(!n||data[n]===undefined)return;cell.html(inner(data[n]));});
+  }
+  function process(){insertHeaders();injectBody();update();}
+  function fetch(){ $.getJSON('/plugins/disk.activity/include/DiskActivity.php',function(r){if(!r)return;if(r._config){var old=mode;mode=r._config.display||'bar';win=r._config.window||'2s';$('.disk-activity-header').text(label());if(old!==mode)$('.disk-activity-cell').remove();}var d={};Object.keys(r).forEach(function(k){if(k!=='_devices'&&k!=='_config')d[k]=r[k];});data=d;process();}); }
+  var obs=new MutationObserver(function(){process();});$('table.disk_status tbody').each(function(){obs.observe(this,{childList:true,subtree:true});});process();fetch();setInterval(fetch,2000);
+});
+</script>

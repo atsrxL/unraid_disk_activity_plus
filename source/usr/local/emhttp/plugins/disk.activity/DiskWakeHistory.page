@@ -1,0 +1,153 @@
+Menu="OtherSettings"
+Title="Disk Wake History"
+Icon="history"
+Tag="hdd-o"
+---
+<?PHP
+/* Disk Activity - Disk Wake History page
+ * GPLv2
+ */
+$v = @filemtime('/usr/local/emhttp/plugins/disk.activity/assets/wake-history.css') ?: time();
+?>
+<link type="text/css" rel="stylesheet" href="/plugins/disk.activity/assets/wake-history.css?v=<?=$v?>">
+
+<div id="wake-tracker-status" class="wake-status">Loading wake tracker…</div>
+
+<div class="wake-cards">
+  <div class="wake-card"><div class="wake-card-value" id="wake24">-</div><div class="wake-card-label">Wakes in last 24h</div></div>
+  <div class="wake-card"><div class="wake-card-value" id="wake7avg">-</div><div class="wake-card-label">7-day average / day</div></div>
+  <div class="wake-card"><div class="wake-card-value wake-card-actor" id="wakeTop">-</div><div class="wake-card-label">Top wake source (7d)</div></div>
+  <div class="wake-card"><div class="wake-card-value" id="wakeTotal">-</div><div class="wake-card-label">Recorded wake events</div></div>
+</div>
+
+<h3>Disk summary</h3>
+<div class="wake-table-wrap">
+<table class="tablesorter wake-table" id="wake-disks">
+<thead><tr>
+  <th>Disk</th><th>State</th><th>24h wakes</th><th>7d wakes</th><th>7d avg/day</th><th>Top source</th><th>Share</th><th>Last wake</th>
+</tr></thead>
+<tbody></tbody>
+</table>
+</div>
+
+<h3>Wake sources</h3>
+<p class="wake-help">Wake share is the percentage of recorded <b>physical HDD wake events</b> in the last 7 days attributed to that source. A mirrored ZFS pool waking two member disks therefore counts as two physical wakes.</p>
+<div class="wake-table-wrap">
+<table class="tablesorter wake-table" id="wake-sources">
+<thead><tr>
+  <th>Source</th><th>24h wakes</th><th>7d wakes</th><th>7d avg/day</th><th>7d wake share</th><th>Disks</th><th>Last wake</th>
+</tr></thead>
+<tbody></tbody>
+</table>
+</div>
+
+<h3>Wake event history</h3>
+<p class="wake-help">A <b>High</b> attribution means a file access from that PID was observed on the disk/pool after the drive was last confirmed in STANDBY and before it became ACTIVE. <b>Unknown</b> means the physical wake was detected but there was no safe userspace attribution; this can happen with metadata-only syscalls, ZFS/kernel I/O, controller activity, or accesses fanotify cannot see.</p>
+<div class="wake-table-wrap">
+<table class="tablesorter wake-table" id="wake-events">
+<thead><tr>
+  <th>Time</th><th>Disk</th><th>Source</th><th>PID</th><th>Operation</th><th>Path</th><th>Confidence</th>
+</tr></thead>
+<tbody></tbody>
+</table>
+</div>
+
+<script>
+$(function() {
+  function esc(v) { return $('<div>').text(v == null ? '' : String(v)).html(); }
+  function when(ms) {
+    if (!ms) return '-';
+    var d = new Date(Number(ms));
+    return d.toLocaleString();
+  }
+  function actor(e) {
+    var c = (e.container || '').trim();
+    var p = (e.process || 'unknown').trim();
+    return c ? c + (p && p !== c ? ' (' + p + ')' : '') : p;
+  }
+  function stateMap(data) {
+    var out = {};
+    if (data.state && Array.isArray(data.state.devices)) {
+      data.state.devices.forEach(function(d) { out[d.disk] = d.state; });
+    }
+    return out;
+  }
+  function stateBadge(s) {
+    s = s || 'unknown';
+    return '<span class="wake-state wake-state-' + esc(s) + '">' + esc(s.toUpperCase()) + '</span>';
+  }
+  function confidenceBadge(s) {
+    s = s || 'unknown';
+    return '<span class="wake-confidence wake-confidence-' + esc(s) + '">' + esc(s.toUpperCase()) + '</span>';
+  }
+  function render(data) {
+    var running = !!(data.state && data.state.updated && (Date.now() - Number(data.state.updated) < 120000));
+    var tracking = !!(data.state && data.state.tracking);
+    $('#wake-tracker-status').attr('class', 'wake-status ' + (running && tracking ? 'wake-ok' : 'wake-warn'))
+      .text(running ? (tracking ? 'Wake tracker running · ' + (data.state.detector || 'auto') + ' detector · check every ' + data.state.poll_seconds + 's' : 'Wake tracker running, attribution disabled') : 'Wake tracker is not reporting. Check Settings → Disk Activity and /var/log/disk_wake_monitor.log.');
+
+    var total24 = 0, total7 = 0;
+    Object.keys(data.disks || {}).forEach(function(k) { total24 += Number(data.disks[k].count24h || 0); total7 += Number(data.disks[k].count7d || 0); });
+    $('#wake24').text(total24);
+    $('#wake7avg').text((total7 / 7).toFixed(2));
+    $('#wakeTotal').text(data.total || 0);
+    var top = Object.keys(data.actors7d || {})[0] || '-';
+    $('#wakeTop').text(top);
+
+    var sm = stateMap(data), rows = '';
+    Object.keys(data.disks || {}).sort().forEach(function(k) {
+      var d = data.disks[k];
+      rows += '<tr>' +
+        '<td>' + esc(k) + (d.device ? ' <span class="wake-dev">(' + esc(d.device) + ')</span>' : '') + '</td>' +
+        '<td>' + stateBadge(sm[k]) + '</td>' +
+        '<td>' + esc(d.count24h) + '</td>' +
+        '<td>' + esc(d.count7d) + '</td>' +
+        '<td>' + esc(d.avg7d) + '</td>' +
+        '<td>' + esc(d.top_actor || '-') + '</td>' +
+        '<td>' + esc(d.top_share || 0) + '%</td>' +
+        '<td title="' + esc(d.last_path || '') + '">' + esc(when(d.last_ts)) + '</td>' +
+        '</tr>';
+    });
+    if (!rows) rows = '<tr><td colspan="8">No wake events recorded yet.</td></tr>';
+    $('#wake-disks tbody').html(rows);
+
+    rows = '';
+    (data.sources || []).forEach(function(s) {
+      rows += '<tr>' +
+        '<td>' + esc(s.source || 'unknown') + '</td>' +
+        '<td>' + esc(s.count24h || 0) + '</td>' +
+        '<td>' + esc(s.count7d || 0) + '</td>' +
+        '<td>' + esc(s.avg7d || 0) + '</td>' +
+        '<td>' + esc(s.share7d || 0) + '%</td>' +
+        '<td>' + esc((s.disks || []).join(', ')) + '</td>' +
+        '<td>' + esc(when(s.last_ts)) + '</td>' +
+        '</tr>';
+    });
+    if (!rows) rows = '<tr><td colspan="7">No attributed wake sources yet.</td></tr>';
+    $('#wake-sources tbody').html(rows);
+
+    rows = '';
+    (data.events || []).forEach(function(e) {
+      rows += '<tr>' +
+        '<td class="wake-nowrap">' + esc(when(e.ts)) + '</td>' +
+        '<td>' + esc(e.disk || e.device || '-') + '</td>' +
+        '<td>' + esc(actor(e)) + '</td>' +
+        '<td>' + esc(e.pid || '-') + '</td>' +
+        '<td>' + esc(e.event || '-') + '</td>' +
+        '<td class="wake-path" title="' + esc(e.path || '') + '">' + esc(e.path || '-') + '</td>' +
+        '<td>' + confidenceBadge(e.confidence) + '</td>' +
+        '</tr>';
+    });
+    if (!rows) rows = '<tr><td colspan="7">No wake events recorded yet. Let a monitored HDD spin down, then access a file on it.</td></tr>';
+    $('#wake-events tbody').html(rows);
+  }
+
+  function refresh() {
+    $.getJSON('/plugins/disk.activity/include/WakeHistory.php?limit=500')
+      .done(render)
+      .fail(function() { $('#wake-tracker-status').attr('class','wake-status wake-warn').text('Unable to read wake tracker API.'); });
+  }
+  refresh();
+  setInterval(refresh, 5000);
+});
+</script>

@@ -1,0 +1,66 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+  <!ENTITY name      "disk.activity">
+  <!ENTITY author    "atsrxL / DerekChan65535">
+  <!ENTITY version   "2026.08.21">
+  <!ENTITY launch    "Settings/DiskActivitySettings">
+  <!ENTITY gitURL    "https://raw.githubusercontent.com/atsrxL/unraid_disk_activity_plus/main">
+  <!ENTITY pluginURL "&gitURL;/disk.activity.plg">
+  <!ENTITY txzURL    "https://github.com/atsrxL/unraid_disk_activity_plus/releases/download/v&version;/disk.activity-&version;.txz">
+  <!ENTITY support   "https://github.com/atsrxL/unraid_disk_activity_plus/issues">
+]>
+<PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="&support;" min="7.3.0" max="7.9.9">
+<CHANGES>
+###2026.08.21
+- Forked from DerekChan65535/unraid-disk-activity 2026.06.08
+- Add HDD wake attribution with physical STANDBY → ACTIVE event tracking
+- Correlate fanotify userspace access with /proc/diskstats physical-I/O onset
+- Record PID, process, Docker/Podman container, operation and path when attribution is safe
+- Add HIGH/UNKNOWN confidence instead of guessing ZFS/kernel wake sources
+- Add Disk Wake History page with 24h/7d counts, average/day and wake-source share
+- Add ZFS pool/dataset mapping for rotational pool members
+- Default to Unraid cached spin state with smartctl -n standby fallback
+- Persist only confirmed wake events to boot flash; ordinary accesses stay in RAM
+</CHANGES>
+<FILE Run="/bin/bash" Method="install">
+<INLINE><![CDATA[
+if [ -x /usr/local/emhttp/plugins/disk.activity/scripts/rc.disk_activity ]; then
+  /usr/local/emhttp/plugins/disk.activity/scripts/rc.disk_activity stop >/dev/null 2>&1 || true
+fi
+]]></INLINE>
+</FILE>
+<FILE Name="/boot/config/plugins/&name;/&name;-&version;.txz" Run="upgradepkg --install-new --reinstall">
+<URL>&txzURL;</URL>
+</FILE>
+<FILE Run="/bin/bash" Method="install">
+<INLINE><![CDATA[
+PLUGIN=/usr/local/emhttp/plugins/disk.activity
+chmod +x "$PLUGIN/scripts/disk_activity" "$PLUGIN/scripts/rc.disk_activity" "$PLUGIN/scripts/disk_wake_tracker" "$PLUGIN/bin/disk_wake_monitor"
+chmod +x "$PLUGIN/event/started/disk_activity_start" "$PLUGIN/event/stopping_svcs/disk_activity_stop"
+mkdir -p /boot/config/plugins/disk.activity
+if [ -e /proc/mdcmd ] && grep -q 'mdState=.*STARTED' /var/local/emhttp/var.ini 2>/dev/null; then
+  "$PLUGIN/scripts/rc.disk_activity" start >/dev/null 2>&1 || true
+fi
+cd /boot/config/plugins/disk.activity || exit 0
+shopt -s nullglob
+for f in disk.activity-*.txz; do
+  [[ "$f" == "disk.activity-&version;.txz" ]] || rm -f "$f"
+done
+]]></INLINE>
+</FILE>
+<FILE Run="/bin/bash" Method="remove">
+<INLINE><![CDATA[
+if [ -x /usr/local/emhttp/plugins/disk.activity/scripts/rc.disk_activity ]; then
+  /usr/local/emhttp/plugins/disk.activity/scripts/rc.disk_activity stop >/dev/null 2>&1 || true
+fi
+for pkg in /var/log/packages/disk.activity-*; do
+  [ -e "$pkg" ] || continue
+  removepkg "$(basename "$pkg")" >/dev/null 2>&1 || true
+done
+rm -f /var/local/emhttp/disk_activity.ini /var/local/emhttp/disk_activity.tmp /var/run/disk_activity.pid
+rm -f /var/local/emhttp/disk_wake_state.json /var/local/emhttp/disk_wake_devices.tsv /var/run/disk_wake_monitor.pid
+rm -rf /usr/local/emhttp/plugins/disk.activity
+rm -rf /boot/config/plugins/disk.activity
+]]></INLINE>
+</FILE>
+</PLUGIN>

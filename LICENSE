@@ -1,0 +1,6 @@
+Disk Activity Plus is distributed under the GNU General Public License version 2 (GPL-2.0-only) for the modified plugin code unless a file carries a different preserved upstream notice.
+
+This project is based on DerekChan65535/unraid-disk-activity. The upstream repository includes an MIT root license while several plugin source files carry GPLv2 notices; those original notices are preserved where applicable.
+
+GPLv2 license text:
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt

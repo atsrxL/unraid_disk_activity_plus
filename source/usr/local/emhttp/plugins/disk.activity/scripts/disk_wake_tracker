@@ -1,0 +1,142 @@
+#!/bin/bash
+# Disk Activity Wake Tracker launcher/map generator
+# GPLv2
+
+PLUGIN=/usr/local/emhttp/plugins/disk.activity
+BIN="$PLUGIN/bin/disk_wake_monitor"
+MAP=/var/local/emhttp/disk_wake_devices.tsv
+PIDFILE=/var/run/disk_wake_monitor.pid
+LOG=/var/log/disk_wake_monitor.log
+CFG=/boot/config/plugins/disk.activity/disk.activity.cfg
+HISTORY=/boot/config/plugins/disk.activity/wake-history.jsonl
+STATE=/var/local/emhttp/disk_wake_state.json
+DISKS=/var/local/emhttp/disks.ini
+
+log() { echo "disk-wake: $*"; }
+
+get_disk_map() {
+  [ -s "$DISKS" ] || return 1
+  awk '
+    /^\[/ {
+      sec=$0; sub(/^\[/,"",sec); sub(/\]$/,"",sec)
+    }
+    /^device=/ {
+      val=$0; sub(/^device=/,"",val); gsub(/"/,"",val)
+      if (sec != "" && val != "") print val "\t" sec
+    }
+  ' "$DISKS"
+}
+
+zpool_for_dev() {
+  local dev="$1" pool="" token real
+  command -v zpool >/dev/null 2>&1 || return 1
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*pool:[[:space:]]+([^[:space:]]+) ]]; then
+      pool="${BASH_REMATCH[1]}"
+      continue
+    fi
+    token=$(awk '{print $1}' <<<"$line")
+    [[ "$token" == /dev/* ]] || continue
+    real=$(readlink -f "$token" 2>/dev/null || true)
+    [ -n "$real" ] || continue
+    if lsblk -sno NAME "$real" 2>/dev/null | grep -Fxq "$dev"; then
+      echo "$pool"
+      return 0
+    fi
+  done < <(zpool status -P 2>/dev/null)
+  return 1
+}
+
+emit_zfs_mounts() {
+  local dev="$1" disk="$2" pool="$3" mp found=0
+  if command -v zfs >/dev/null 2>&1; then
+    while IFS= read -r mp; do
+      case "$mp" in
+        ""|none|legacy|-) continue ;;
+      esac
+      [[ "$mp" == /* ]] || continue
+      [ -d "$mp" ] || continue
+      printf '%s\t%s\t%s\n' "$dev" "$disk" "$mp"
+      found=1
+    done < <(zfs list -H -o mountpoint -r "$pool" 2>/dev/null)
+  fi
+  if [ "$found" -eq 0 ] && [ -d "/mnt/$pool" ]; then
+    printf '%s\t%s\t%s\n' "$dev" "$disk" "/mnt/$pool"
+  fi
+}
+
+generate_map() {
+  local tmp="${MAP}.tmp.$$" dev disk pool mp count=0
+  : > "$tmp"
+
+  while IFS=$'\t' read -r dev disk; do
+    [ -b "/dev/$dev" ] || continue
+    [ "$(cat "/sys/block/$dev/queue/rotational" 2>/dev/null)" = "1" ] || continue
+
+    mp="/mnt/$disk"
+    if [ -d "$mp" ] && mountpoint -q "$mp" 2>/dev/null; then
+      printf '%s\t%s\t%s\n' "$dev" "$disk" "$mp" >> "$tmp"
+      count=$((count + 1))
+    fi
+
+    pool=$(zpool_for_dev "$dev" 2>/dev/null || true)
+    if [ -n "$pool" ]; then
+      emit_zfs_mounts "$dev" "$disk" "$pool" >> "$tmp"
+      count=$((count + 1))
+    fi
+  done < <(get_disk_map)
+
+  awk '!seen[$0]++' "$tmp" > "$MAP"
+  rm -f "$tmp"
+
+  [ -s "$MAP" ] || {
+    log "no rotational mounted devices found; wake tracker not started"
+    return 1
+  }
+  return 0
+}
+
+start() {
+  if [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    log "already running (PID $(cat "$PIDFILE"))"
+    return 0
+  fi
+  [ -x "$BIN" ] || { log "monitor binary missing: $BIN"; return 1; }
+  mkdir -p /var/local/emhttp /boot/config/plugins/disk.activity
+  [ -e "$HISTORY" ] || : > "$HISTORY"
+  generate_map || return 0
+
+  nohup "$BIN" --map "$MAP" --history "$HISTORY" --state "$STATE" --config "$CFG" >>"$LOG" 2>&1 &
+  echo $! > "$PIDFILE"
+  log "started (PID $!)"
+}
+
+stop() {
+  if [ -s "$PIDFILE" ]; then
+    pid=$(cat "$PIDFILE")
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      for _ in {1..20}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$PIDFILE" "$STATE" "$MAP"
+}
+
+status() {
+  if [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "disk wake monitor is running (PID $(cat "$PIDFILE"))"
+    [ -s "$STATE" ] && cat "$STATE"
+  else
+    echo "disk wake monitor is not running"
+  fi
+}
+
+case "$1" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; sleep 0.2; start ;;
+  remap) stop; start ;;
+  status) status ;;
+  *) echo "Usage: $0 start|stop|restart|remap|status"; exit 2 ;;
+esac
