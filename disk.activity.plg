@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "disk.activity">
   <!ENTITY author    "atsrxL / DerekChan65535">
-  <!ENTITY version   "2026.08.21.4">
+  <!ENTITY version   "2026.08.21.5">
   <!ENTITY launch    "Settings/DiskActivityPlus">
   <!ENTITY gitURL    "https://raw.githubusercontent.com/atsrxL/unraid_disk_activity_plus/main">
   <!ENTITY pluginURL "&gitURL;/disk.activity.plg">
@@ -11,6 +11,17 @@
 ]>
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="&support;" min="7.3.0" max="7.9.9">
 <CHANGES>
+###2026.08.21.5
+- Improve Docker/SMB attribution by correlating unique fanotify events from /mnt/user and /mnt/user0 with physical disk I/O
+- Harden container-name lookup with strict IDs, fork/exec instead of shell commands, TTL caching and eviction
+- Validate Unraid CSRF tokens before Reset Wake Statistics
+- Make history prune/reset atomic and coordinate C/PHP history access through a shared lock
+- Fix SIGHUP so it reloads configuration instead of terminating the wake monitor
+- Consolidate the native monitor into one maintainable disk_wake_monitor.c source and add --help/--version
+- Remove the Dashboard Open Files tile while keeping the Open Files diagnostic tab
+- Fix history retention at 60 days / 5,000 events and remove obsolete retention/dashboard settings
+- Refactor duplicated frontend helpers into a readable shared JavaScript asset
+
 ###2026.08.21.4
 - Remove the legacy Main-page Activity % column and its 2-second /proc/diskstats sampler daemon
 - Remove obsolete Activity display style and averaging-window settings
@@ -26,15 +37,13 @@
 - Keep a single Settings > User Utilities entry with Open Files / Settings and Wake History tabs
 
 ###2026.08.21.1
-- Add native sortable Dashboard tile for currently open HDD files
 - Add RAM-only /proc open-FD snapshots with process and Docker/Podman attribution
-- Add Reset Wake Statistics action with Unraid CSRF protection and file locking
+- Add Reset Wake Statistics action with file locking
 - Count only HIGH-confidence events toward named wake-source percentages; MEDIUM remains a visible possible source
 - Make open-FD fallback conservative: exactly one matching process is required for MEDIUM, otherwise UNKNOWN/ambiguous
 - Skip open-FD attribution work entirely when wake tracking is disabled
-- Add bounded wake-history retention (days + maximum events) and RAM API caching
+- Add bounded wake-history retention and RAM API caching
 - Only map ZFS datasets that are actually mounted
-- Rebuild the native wake monitor from validated source fragments with -Werror checks
 - Harden release workflow: explicit version validation, immutable releases, and tag the exact build commit
 
 ###2026.08.21
@@ -46,9 +55,10 @@ PLUGIN=/usr/local/emhttp/plugins/disk.activity
 if [ -x "$PLUGIN/scripts/rc.disk_activity" ]; then
   "$PLUGIN/scripts/rc.disk_activity" stop >/dev/null 2>&1 || true
 fi
-# Remove legacy UI/sampler files left by earlier releases or unmanaged overlays.
+# Pre-upgrade cleanup removes files from old packages/overlays before the new package is unpacked.
 rm -f "$PLUGIN/DiskActivitySettings.page" \
       "$PLUGIN/DiskActivityColumn.page" \
+      "$PLUGIN/DiskActivityDashboard.page" \
       "$PLUGIN/include/DiskActivity.php" \
       "$PLUGIN/scripts/disk_activity" \
       "$PLUGIN/assets/disk-activity.css"
@@ -61,9 +71,10 @@ rm -f /var/local/emhttp/disk_activity.ini /var/local/emhttp/disk_activity.tmp /v
 <FILE Run="/bin/bash" Method="install">
 <INLINE><![CDATA[
 PLUGIN=/usr/local/emhttp/plugins/disk.activity
-# Defensive post-upgrade cleanup for files that may not be owned by the current Slackware package.
+# Post-upgrade cleanup is intentional: earlier test overlays could leave files not owned by pkgtools.
 rm -f "$PLUGIN/DiskActivitySettings.page" \
       "$PLUGIN/DiskActivityColumn.page" \
+      "$PLUGIN/DiskActivityDashboard.page" \
       "$PLUGIN/include/DiskActivity.php" \
       "$PLUGIN/scripts/disk_activity" \
       "$PLUGIN/assets/disk-activity.css"
@@ -73,7 +84,13 @@ chmod +x "$PLUGIN/event/started/disk_activity_start" "$PLUGIN/event/stopping_svc
 mkdir -p /boot/config/plugins/disk.activity
 CFG=/boot/config/plugins/disk.activity/disk.activity.cfg
 if [ -f "$CFG" ]; then
-  sed -i '/^display=/d;/^window=/d' "$CFG"
+  sed -i \
+    -e '/^display=/d' \
+    -e '/^window=/d' \
+    -e '/^open_files_dashboard=/d' \
+    -e '/^history_days=/d' \
+    -e '/^history_max=/d' \
+    "$CFG"
 fi
 if [ -e /proc/mdcmd ] && grep -q 'mdState=.*STARTED' /var/local/emhttp/var.ini 2>/dev/null; then
   "$PLUGIN/scripts/rc.disk_activity" start >/dev/null 2>&1 || true
@@ -96,7 +113,7 @@ for pkg in /var/log/packages/disk.activity-*; do
   removepkg "$(basename "$pkg")" >/dev/null 2>&1 || true
 done
 rm -f /var/local/emhttp/disk_activity.ini /var/local/emhttp/disk_activity.tmp /var/run/disk_activity.pid
-rm -f /var/local/emhttp/disk_wake_state.json /var/local/emhttp/disk_wake_devices.tsv /var/local/emhttp/disk_open_files.json /var/local/emhttp/disk_wake_history_cache.json /var/run/disk_wake_monitor.pid
+rm -f /var/local/emhttp/disk_wake_state.json /var/local/emhttp/disk_wake_devices.tsv /var/local/emhttp/disk_open_files.json /var/local/emhttp/disk_wake_history_cache.json /var/run/disk_wake_monitor.pid /var/lock/disk_activity_plus_history.lock
 rm -rf /usr/local/emhttp/plugins/disk.activity
 rm -rf /boot/config/plugins/disk.activity
 ]]></INLINE>
