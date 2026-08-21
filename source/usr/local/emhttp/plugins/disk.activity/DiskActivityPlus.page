@@ -1,5 +1,6 @@
 Menu="Utilities"
 Title="Disk Activity Plus"
-Type="menu"
+Type="xmenu"
+Tabs="true"
 Icon="area-chart"
 Tag="hdd-o"
