@@ -1,5 +1,5 @@
 Menu="DiskActivityPlus"
-Title="Activity / Open Files"
+Title="Open Files / Settings"
 Icon="folder-open-o"
 ---
 <?PHP
@@ -25,24 +25,8 @@ $v = @filemtime('/usr/local/emhttp/plugins/disk.activity/assets/wake-history.css
 </table>
 </div>
 
-<h3>Disk Activity display</h3>
 <form markdown="1" method="POST" action="/update.php" target="progressFrame">
 <input type="hidden" name="#file" value="<?=$plugin?>/<?=$plugin?>.cfg">
-
-_(Activity display style)_:
-: <select name="display">
-  <?=mk_option($cfg['display'] ?? 'bar', "bar", _("Text with styled bar"))?>
-  <?=mk_option($cfg['display'] ?? 'bar', "color", _("Text with color"))?>
-  <?=mk_option($cfg['display'] ?? 'bar', "plain", _("Plain text"))?>
-  </select>
-
-_(Averaging window)_:
-: <select name="window">
-  <?=mk_option($cfg['window'] ?? '2s', "2s", _("Instant (2s)"))?>
-  <?=mk_option($cfg['window'] ?? '2s', "10s", _("10 seconds"))?>
-  <?=mk_option($cfg['window'] ?? '2s', "1min", _("1 minute"))?>
-  <?=mk_option($cfg['window'] ?? '2s', "5min", _("5 minutes"))?>
-  </select>
 
 <h3>Wake attribution</h3>
 _(Track HDD wake events)_:
@@ -105,7 +89,7 @@ _(Maximum retained wake events)_:
 
 > **Attribution confidence:** HIGH requires a fanotify access immediately before physical I/O. MEDIUM is used only when exactly one process has a matching file/directory open at I/O onset. If multiple processes are plausible, the event remains UNKNOWN/ambiguous and is not credited to a process in wake-source statistics.
 >
-> Current-open-file snapshots and power/activity state files live under `/var/local/emhttp` (RAM). Wake history is the only persistent runtime data written to the boot device.
+> Current-open-file snapshots and power-state files live under `/var/local/emhttp` (RAM). Wake history is the only persistent runtime data written to the boot device.
 
 <input type="submit" name="#default" value="_(Default)_">
 : <input type="submit" name="#apply" value="_(Apply)_"><input type="button" value="_(Done)_" onclick="done()">
