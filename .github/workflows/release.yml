@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version, e.g. 2026.08.21.1'
+        description: 'Release version, e.g. 2026.08.21.5'
         required: true
         type: string
 permissions:
@@ -19,6 +19,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
+
       - name: Resolve and validate version
         id: version
         shell: bash
@@ -32,13 +33,24 @@ jobs:
           [[ "$VERSION" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}([.][0-9]+)?$ ]] || { echo "Invalid version: $VERSION" >&2; exit 1; }
           PLG_VERSION=$(sed -n 's/.*<!ENTITY version[[:space:]]*"\([^"]*\)".*/\1/p' disk.activity.plg | head -n1)
           [[ "$PLG_VERSION" == "$VERSION" ]] || { echo "disk.activity.plg version $PLG_VERSION does not match release $VERSION" >&2; exit 1; }
+          test -f source/usr/local/emhttp/plugins/disk.activity/src/disk_wake_monitor.c
+          if compgen -G 'source/usr/local/emhttp/plugins/disk.activity/src/disk_wake_monitor.part*.inc' >/dev/null; then
+            echo "Legacy monitor source fragments still present" >&2
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Validate shared JavaScript
+        run: |
+          node --check source/usr/local/emhttp/plugins/disk.activity/assets/disk-activity-plus.js
+
       - name: Build and validate plugin package
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y build-essential libc6-dev xz-utils php-cli
           ./build.sh '${{ steps.version.outputs.version }}'
+
       - name: Publish immutable GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
