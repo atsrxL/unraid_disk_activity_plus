@@ -2,7 +2,7 @@
 header('Content-Type: application/json');
 header('Cache-Control: no-store');
 
-function fail_json(int $status, string $message): never {
+function fail_json(int $status, string $message) {
     http_response_code($status);
     echo json_encode(['ok' => false, 'error' => $message]);
     exit;
