@@ -14,6 +14,7 @@ This release removes the original Activity % subsystem and keeps Disk Activity P
 - HIGH/MEDIUM/UNKNOWN process attribution.
 - Live open-file snapshots and Dashboard tile.
 - Reset Wake Statistics, bounded history retention, and RAM caching.
+- Lightweight `/proc/diskstats` checks inside the wake monitor remain only for correlating a candidate access with the first real block-I/O onset; this is separate from the removed Activity % sampler.
 
 ### Upgrade cleanup
 - Old Activity files are explicitly removed before and after package upgrade.
