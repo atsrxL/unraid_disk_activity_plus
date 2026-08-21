@@ -1,48 +1,32 @@
 #!/bin/bash
-# rc.disk_activity - Start/stop disk activity + wake attribution daemons
+# rc.disk_activity - Start/stop Disk Activity Plus wake/open-file monitor
 
-DAEMON=/usr/local/emhttp/plugins/disk.activity/scripts/disk_activity
 WAKE=/usr/local/emhttp/plugins/disk.activity/scripts/disk_wake_tracker
-PIDFILE=/var/run/disk_activity.pid
-INI=/var/local/emhttp/disk_activity.ini
+LEGACY_PID=/var/run/disk_activity.pid
+LEGACY_INI=/var/local/emhttp/disk_activity.ini
+LEGACY_TMP=/var/local/emhttp/disk_activity.tmp
 
-start_activity() {
-  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    echo "disk_activity daemon already running (PID $(cat "$PIDFILE"))"
-  else
-    nohup "$DAEMON" >/dev/null 2>&1 &
-    echo "disk_activity daemon started"
-  fi
-}
-
-stop_activity() {
-  if [ -f "$PIDFILE" ]; then
-    local pid
-    pid=$(cat "$PIDFILE")
-    if kill -0 "$pid" 2>/dev/null; then
+cleanup_legacy_activity() {
+  if [ -f "$LEGACY_PID" ]; then
+    pid=$(cat "$LEGACY_PID" 2>/dev/null || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
     fi
-    rm -f "$PIDFILE"
   fi
-  rm -f "$INI"
+  rm -f "$LEGACY_PID" "$LEGACY_INI" "$LEGACY_TMP"
 }
 
 start() {
-  start_activity
+  cleanup_legacy_activity
   [ -x "$WAKE" ] && "$WAKE" start
 }
 
 stop() {
   [ -x "$WAKE" ] && "$WAKE" stop
-  stop_activity
+  cleanup_legacy_activity
 }
 
 status() {
-  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    echo "disk_activity is running (PID $(cat "$PIDFILE"))"
-  else
-    echo "disk_activity is not running"
-  fi
   [ -x "$WAKE" ] && "$WAKE" status
 }
 
