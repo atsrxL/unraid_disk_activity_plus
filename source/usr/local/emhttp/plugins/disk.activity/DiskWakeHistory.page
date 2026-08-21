@@ -83,19 +83,24 @@ $(function () {
 
   function confidenceBadge(value, evidence) {
     var state = String(value || 'unknown').toLowerCase();
-    var title = evidence ? ' title="' + DAP.escapeHtml(evidence) + '"' : '';
-    return '<span class="wake-confidence wake-confidence-' + DAP.escapeHtml(state) + '"' + title + '>' +
+    if (['high', 'medium', 'unknown'].indexOf(state) === -1) state = 'unknown';
+    var title = evidence ? ' title="' + DAP.escapeAttribute(evidence) + '"' : '';
+    return '<span class="wake-confidence wake-confidence-' + state + '"' + title + '>' +
       DAP.escapeHtml(state.toUpperCase()) + '</span>';
   }
 
   function stateBadge(value) {
     var state = String(value || 'unknown').toLowerCase();
-    return '<span class="wake-state wake-state-' + DAP.escapeHtml(state) + '">' +
+    if (['active', 'standby', 'unknown'].indexOf(state) === -1) state = 'unknown';
+    return '<span class="wake-state wake-state-' + state + '">' +
       DAP.escapeHtml(state.toUpperCase()) + '</span>';
   }
 
   function render(data) {
-    var running = !!(data.state && data.state.updated && (Date.now() - Number(data.state.updated) < 120000));
+    var serverNow = Number(data.now || 0);
+    var stateUpdated = Number(data.state && data.state.updated || 0);
+    var stateAge = serverNow - stateUpdated;
+    var running = !!(serverNow && stateUpdated && stateAge >= -30000 && stateAge < 120000);
     var tracking = !!(data.state && data.state.tracking);
 
     var statusText;
@@ -149,7 +154,7 @@ $(function () {
         '<td>' + DAP.escapeHtml(disk.avg7d) + '</td>' +
         '<td>' + DAP.escapeHtml(disk.top_actor || '-') + '</td>' +
         '<td>' + DAP.escapeHtml(disk.top_share || 0) + '%</td>' +
-        '<td title="' + DAP.escapeHtml(disk.last_path || '') + '">' + DAP.escapeHtml(DAP.formatTime(disk.last_ts)) + '</td>' +
+        '<td title="' + DAP.escapeAttribute(disk.last_path || '') + '">' + DAP.escapeHtml(DAP.formatTime(disk.last_ts)) + '</td>' +
       '</tr>';
     });
     if (!rows) rows = '<tr><td colspan="8">No wake events recorded yet.</td></tr>';
@@ -183,7 +188,7 @@ $(function () {
         '<td>' + DAP.escapeHtml(actor) + '</td>' +
         '<td>' + DAP.escapeHtml(event.pid || '-') + '</td>' +
         '<td>' + DAP.escapeHtml(event.event || '-') + '</td>' +
-        '<td class="wake-path" title="' + DAP.escapeHtml(event.path || '') + '">' + DAP.escapeHtml(event.path || '-') + '</td>' +
+        '<td class="wake-path" title="' + DAP.escapeAttribute(event.path || '') + '">' + DAP.escapeHtml(event.path || '-') + '</td>' +
         '<td>' + confidenceBadge(event.confidence, event.evidence) + '</td>' +
       '</tr>';
     });

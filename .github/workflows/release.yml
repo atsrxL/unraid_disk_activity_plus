@@ -1,55 +1,131 @@
 name: Publish Release
 on:
-  push:
-    branches:
-      - 'release/**'
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version, e.g. 2026.08.21.5'
+        description: 'Release version, e.g. 2026.08.21.7'
         required: true
         type: string
 permissions:
   contents: write
+
+# A version has exactly one publisher. Manual dispatch from the final main
+# commit avoids an early release/** push permanently claiming an immutable tag.
+concurrency:
+  group: disk-activity-release-${{ inputs.version }}
+  cancel-in-progress: false
+
 jobs:
   release:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'release/')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
 
       - name: Resolve and validate version
         id: version
         shell: bash
+        env:
+          RELEASE_VERSION_INPUT: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            VERSION='${{ inputs.version }}'
-          else
-            VERSION="${GITHUB_REF_NAME#release/}"
-          fi
+          VERSION="$RELEASE_VERSION_INPUT"
           [[ "$VERSION" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}([.][0-9]+)?$ ]] || { echo "Invalid version: $VERSION" >&2; exit 1; }
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || { echo "Releases must be dispatched from main, not $GITHUB_REF" >&2; exit 1; }
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          BUILD_SHA=$(git rev-parse HEAD)
+          MAIN_SHA=$(git rev-parse origin/main)
+          [[ "$BUILD_SHA" == "$GITHUB_SHA" && "$BUILD_SHA" == "$MAIN_SHA" ]] || {
+            echo "Selected commit is not the current main head (build=$BUILD_SHA event=$GITHUB_SHA main=$MAIN_SHA)" >&2
+            exit 1
+          }
           PLG_VERSION=$(sed -n 's/.*<!ENTITY version[[:space:]]*"\([^"]*\)".*/\1/p' disk.activity.plg | head -n1)
           [[ "$PLG_VERSION" == "$VERSION" ]] || { echo "disk.activity.plg version $PLG_VERSION does not match release $VERSION" >&2; exit 1; }
+          PLG_MD5=$(sed -n 's/.*<!ENTITY md5[[:space:]]*"\([0-9A-Fa-f]*\)".*/\1/p' disk.activity.plg | head -n1)
+          [[ "$PLG_MD5" =~ ^[0-9A-Fa-f]{32}$ ]] || { echo "disk.activity.plg must contain a 32-character md5 entity" >&2; exit 1; }
+          grep -Fq '<MD5>&md5;</MD5>' disk.activity.plg || { echo "Package FILE must enforce &md5;" >&2; exit 1; }
           test -f source/usr/local/emhttp/plugins/disk.activity/src/disk_wake_monitor.c
           if compgen -G 'source/usr/local/emhttp/plugins/disk.activity/src/disk_wake_monitor.part*.inc' >/dev/null; then
             echo "Legacy monitor source fragments still present" >&2
             exit 1
           fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$VERSION"
+            echo "md5=${PLG_MD5,,}"
+            echo "sha=$BUILD_SHA"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Validate shared JavaScript
-        run: |
-          node --check source/usr/local/emhttp/plugins/disk.activity/assets/disk-activity-plus.js
-
-      - name: Build and validate plugin package
+      - name: Install build dependencies
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y build-essential libc6-dev xz-utils php-cli
+          sudo apt-get install -y build-essential libc6-dev xz-utils php-cli libxml2-utils shellcheck
+
+      - name: Validate source files
+        run: |
+          bash -n build.sh
+          bash -n source/usr/local/emhttp/plugins/disk.activity/scripts/rc.disk_activity
+          bash -n source/usr/local/emhttp/plugins/disk.activity/scripts/disk_wake_tracker
+          bash -n source/usr/local/emhttp/plugins/disk.activity/event/started/disk_activity_start
+          bash -n source/usr/local/emhttp/plugins/disk.activity/event/stopping_svcs/disk_activity_stop
+          shellcheck -x build.sh \
+            source/usr/local/emhttp/plugins/disk.activity/scripts/rc.disk_activity \
+            source/usr/local/emhttp/plugins/disk.activity/scripts/disk_wake_tracker \
+            source/usr/local/emhttp/plugins/disk.activity/event/started/disk_activity_start \
+            source/usr/local/emhttp/plugins/disk.activity/event/stopping_svcs/disk_activity_stop
+          node --check source/usr/local/emhttp/plugins/disk.activity/assets/disk-activity-plus.js
+          xmllint --noout disk.activity.plg
+          inline_count=$(xmllint --xpath 'count(//INLINE)' disk.activity.plg)
+          for ((inline_index=1; inline_index<=inline_count; inline_index++)); do
+            xmllint --xpath "string((//INLINE)[$inline_index])" disk.activity.plg | bash -n
+          done
+
+      - name: Build and validate reproducible plugin package
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.version.outputs.version }}'
           ./build.sh '${{ steps.version.outputs.version }}'
+          cp "build/disk.activity-${VERSION}.txz" "$RUNNER_TEMP/first.txz"
+          cp "build/disk.activity-${VERSION}.md5" "$RUNNER_TEMP/first.md5"
+          cp "build/disk.activity-${VERSION}.sha256" "$RUNNER_TEMP/first.sha256"
+          ./build.sh "$VERSION"
+          cmp "$RUNNER_TEMP/first.txz" "build/disk.activity-${VERSION}.txz"
+          cmp "$RUNNER_TEMP/first.md5" "build/disk.activity-${VERSION}.md5"
+          cmp "$RUNNER_TEMP/first.sha256" "build/disk.activity-${VERSION}.sha256"
+          (
+            cd build
+            md5sum -c "disk.activity-${VERSION}.md5"
+            sha256sum -c "disk.activity-${VERSION}.sha256"
+          )
+          ACTUAL_MD5=$(cut -d' ' -f1 "build/disk.activity-${VERSION}.md5")
+          [[ "$ACTUAL_MD5" == '${{ steps.version.outputs.md5 }}' ]] || {
+            echo "Built MD5 $ACTUAL_MD5 does not match disk.activity.plg MD5 ${{ steps.version.outputs.md5 }}" >&2
+            exit 1
+          }
+
+      - name: Revalidate immutable release target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.version.outputs.version }}'
+          TAG="v${VERSION}"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          [[ "$(git rev-parse origin/main)" == '${{ steps.version.outputs.sha }}' ]] || {
+            echo "main advanced during the build; dispatch again from the new final commit" >&2
+            exit 1
+          }
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists; refusing to retarget it." >&2
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; refusing to overwrite immutable assets." >&2
+            exit 1
+          fi
 
       - name: Publish immutable GitHub Release
         env:
@@ -63,10 +139,11 @@ jobs:
             exit 1
           fi
           gh release create "$TAG" \
+            "disk.activity.plg" \
             "build/disk.activity-${VERSION}.txz" \
             "build/disk.activity-${VERSION}.md5" \
             "build/disk.activity-${VERSION}.sha256" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
+            --target '${{ steps.version.outputs.sha }}' \
             --title "Disk Activity Plus ${VERSION}" \
             --notes-file RELEASE_NOTES.md

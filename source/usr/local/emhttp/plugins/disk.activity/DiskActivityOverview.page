@@ -106,7 +106,7 @@ $(function () {
         '<td>' + DAP.escapeHtml(actor) + '</td>' +
         '<td>' + DAP.escapeHtml(entry.pid || '-') + '</td>' +
         '<td>' + DAP.escapeHtml(entry.disk || entry.device || '-') + '</td>' +
-        '<td class="wake-path" title="' + DAP.escapeHtml(entry.path || '') + '">' +
+        '<td class="wake-path" title="' + DAP.escapeAttribute(entry.path || '') + '">' +
           DAP.escapeHtml(entry.path || '-') +
         '</td>' +
       '</tr>';

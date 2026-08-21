@@ -45,7 +45,7 @@ The `/mnt/user` correlation is specifically intended to improve Docker, SMB and 
 
 ## Security and maintainability
 
-- Reset Wake Statistics validates the current Unraid CSRF token.
+- Reset Wake Statistics keeps the endpoint simple and broadly compatible while rejecting browser requests that are clearly cross-origin.
 - Docker/Podman container inspection uses `fork`/`exec`, not shell interpolation.
 - Container-name cache entries use TTLs and bounded eviction.
 - The native monitor is maintained as one normal `disk_wake_monitor.c` translation unit and is built with `-Wall -Wextra -Werror`.

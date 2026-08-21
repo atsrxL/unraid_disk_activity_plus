@@ -1,2 +1,7 @@
 #!/bin/bash
-/usr/local/emhttp/plugins/disk.activity/scripts/rc.disk_activity start >/dev/null 2>&1
+RC=/usr/local/emhttp/plugins/disk.activity/scripts/rc.disk_activity
+if ! output=$("$RC" start 2>&1); then
+  logger -t disk.activity "startup failed: $output"
+  exit 1
+fi
+[ -z "$output" ] || logger -t disk.activity "$output"

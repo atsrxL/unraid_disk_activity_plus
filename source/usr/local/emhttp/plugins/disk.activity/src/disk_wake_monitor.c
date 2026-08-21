@@ -29,6 +29,7 @@
 #define MAX_OPEN_IDENTITIES 512
 #define MAX_CONTAINER_CACHE 256
 #define MAX_USER_SHARE_EVENTS 32
+#define MAX_DIRECT_EVENTS 32
 #define STR_SMALL 128
 #define STR_MED 512
 #define STR_PATH 4096
@@ -40,6 +41,23 @@
 #define HISTORY_MAX 5000
 #define CONTAINER_CACHE_TTL_MS (10LL * 60LL * 1000LL)
 #define CONTAINER_CACHE_NEGATIVE_TTL_MS (30LL * 1000LL)
+#define CONTAINER_INSPECT_TIMEOUT_MS 1000
+#define SMARTCTL_TIMEOUT_MS 1500
+#define CHILD_TERM_GRACE_MS 200
+#define CHILD_KILL_REAP_GRACE_MS 200
+#ifndef MAX_PENDING_CHILDREN
+#define MAX_PENDING_CHILDREN 256
+#endif
+#define OPEN_FD_ATTRIBUTION_BUDGET_MS 250
+#define OPEN_FD_ATTRIBUTION_CYCLE_BUDGET_MS 500
+#define OPEN_FD_ATTRIBUTION_MAX_PIDS 4096
+#define OPEN_FD_ATTRIBUTION_MAX_FDS 32768
+#define OPEN_FILES_SCAN_BUDGET_MS 1000
+#define OPEN_FILES_SCAN_MAX_PIDS 8192
+#define OPEN_FILES_SCAN_MAX_FDS 65536
+#define POWER_CHECK_BUDGET_MS 3000
+#define FANOTIFY_PROCESS_BUDGET_MS 100
+#define FANOTIFY_PROCESS_MAX_EVENTS 4096
 
 #ifndef DAP_VERSION
 #define DAP_VERSION "dev"
@@ -50,6 +68,7 @@ typedef enum { PWR_UNKNOWN = 0, PWR_STANDBY = 1, PWR_ACTIVE = 2 } power_state_t;
 typedef struct {
     int valid;
     int64_t ts_ms;
+    int64_t mono_ms;
     pid_t pid;
     char event[24];
     char comm[STR_SMALL];
@@ -74,8 +93,12 @@ typedef struct {
     int io_initialized;
     int io_pending;
     int64_t io_onset_ms;
+    int64_t io_onset_mono_ms;
     int ambiguous_count;
-    candidate_t recent_event;
+    char uncertain_evidence[32];
+    candidate_t recent_events[MAX_DIRECT_EVENTS];
+    int recent_event_count;
+    int64_t recent_event_overflow_mono_ms;
     candidate_t candidate;
 } device_t;
 
@@ -108,6 +131,12 @@ static container_cache_t container_cache[MAX_CONTAINER_CACHE];
 static int container_cache_count = 0;
 static candidate_t user_share_events[MAX_USER_SHARE_EVENTS];
 static int user_share_event_count = 0;
+static int64_t user_share_overflow_mono_ms = 0;
+static int64_t fanotify_poisoned_until_mono_ms = 0;
+static int64_t open_fd_cycle_deadline_mono_ms = 0;
+static int64_t container_command_deadline_mono_ms = 0;
+static pid_t pending_children[MAX_PENDING_CHILDREN];
+static int pending_child_count = 0;
 
 static char map_file[STR_PATH] = "/var/local/emhttp/disk_wake_devices.tsv";
 static char history_file[STR_PATH] = "/boot/config/plugins/disk.activity/wake-history.jsonl";
@@ -137,10 +166,18 @@ static void on_hup_signal(int sig) {
     reload_requested = 1;
 }
 
-static int64_t now_ms(void) {
+static int64_t clock_ms(clockid_t clock_id) {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    if (clock_gettime(clock_id, &ts) != 0) return 0;
     return (int64_t)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static int64_t realtime_ms(void) {
+    return clock_ms(CLOCK_REALTIME);
+}
+
+static int64_t monotonic_ms(void) {
+    return clock_ms(CLOCK_MONOTONIC);
 }
 
 static const char *state_name(power_state_t s) {
@@ -234,12 +271,73 @@ static void get_container_id(pid_t pid, char *out, size_t outsz) {
     if (!strict_container_id(out)) out[0] = '\0';
 }
 
-static int inspect_container_runtime(const char *runtime, const char *id, char *out, size_t outsz) {
+static void reap_pending_children(void) {
+    int keep = 0;
+    for (int i = 0; i < pending_child_count; i++) {
+        int status = 0;
+        pid_t child = pending_children[i];
+        pid_t rc = waitpid(child, &status, WNOHANG);
+        if (rc == child || (rc < 0 && errno == ECHILD)) continue;
+        pending_children[keep++] = child;
+    }
+    pending_child_count = keep;
+}
+
+static void remember_pending_child(pid_t child) {
+    reap_pending_children();
+    for (int i = 0; i < pending_child_count; i++) {
+        if (pending_children[i] == child) return;
+    }
+    if (pending_child_count < MAX_PENDING_CHILDREN) {
+        pending_children[pending_child_count++] = child;
+    } else {
+        fprintf(stderr, "pending child reap queue full; pid=%d remains owned by monitor\n", child);
+    }
+}
+
+static void terminate_and_reap(pid_t child) {
+    int status = 0;
+    pid_t rc = waitpid(child, &status, WNOHANG);
+    if (rc == child || (rc < 0 && errno == ECHILD)) return;
+
+    (void)kill(child, SIGTERM);
+    int64_t deadline = monotonic_ms() + CHILD_TERM_GRACE_MS;
+    while (monotonic_ms() < deadline) {
+        rc = waitpid(child, &status, WNOHANG);
+        if (rc == child || (rc < 0 && errno == ECHILD)) return;
+        if (rc < 0 && errno != EINTR) break;
+        (void)poll(NULL, 0, 20);
+    }
+
+    (void)kill(child, SIGKILL);
+    deadline = monotonic_ms() + CHILD_KILL_REAP_GRACE_MS;
+    while (monotonic_ms() < deadline) {
+        rc = waitpid(child, &status, WNOHANG);
+        if (rc == child || (rc < 0 && errno == ECHILD)) return;
+        if (rc < 0 && errno != EINTR) break;
+        (void)poll(NULL, 0, 20);
+    }
+    remember_pending_child(child);
+}
+
+static int run_command_capture(char *const argv[], int merge_stderr, int require_zero,
+                               int timeout_ms, char *out, size_t outsz) {
+    if (!argv || !argv[0] || !out || outsz == 0) return 0;
+    reap_pending_children();
     out[0] = '\0';
-    if (!strict_container_id(id)) return 0;
+    if (pending_child_count >= MAX_PENDING_CHILDREN) {
+        fprintf(stderr, "pending child reap queue full; external command suppressed\n");
+        return 0;
+    }
 
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) != 0) return 0;
+    int flags = fcntl(pipefd[0], F_GETFL, 0);
+    if (flags < 0 || fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK) != 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return 0;
+    }
 
     pid_t child = fork();
     if (child < 0) {
@@ -248,28 +346,102 @@ static int inspect_container_runtime(const char *runtime, const char *id, char *
         return 0;
     }
     if (child == 0) {
-        int nullfd = open("/dev/null", O_WRONLY | O_CLOEXEC);
-        dup2(pipefd[1], STDOUT_FILENO);
-        if (nullfd >= 0) dup2(nullfd, STDERR_FILENO);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        (void)setenv("LC_ALL", "C", 1);
+        int nullfd = -1;
+        if (!merge_stderr) nullfd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(126);
+        if (merge_stderr) {
+            if (dup2(pipefd[1], STDERR_FILENO) < 0) _exit(126);
+        } else if (nullfd >= 0 && dup2(nullfd, STDERR_FILENO) < 0) {
+            _exit(126);
+        }
         close(pipefd[0]);
         close(pipefd[1]);
         if (nullfd > STDERR_FILENO) close(nullfd);
-        execlp(runtime, runtime, "inspect", "--format", "{{.Name}}", id, (char *)NULL);
+        execvp(argv[0], argv);
         _exit(127);
     }
 
     close(pipefd[1]);
-    FILE *fp = fdopen(pipefd[0], "r");
-    if (fp) {
-        if (fgets(out, (int)outsz, fp)) trim(out);
-        fclose(fp);
-    } else {
-        close(pipefd[0]);
+    size_t used = 0;
+    int status = 0;
+    int child_done = 0;
+    int wait_error = 0;
+    int timed_out = 0;
+    int64_t deadline = monotonic_ms() + timeout_ms;
+
+    while (!child_done) {
+        char chunk[1024];
+        ssize_t n;
+        while ((n = read(pipefd[0], chunk, sizeof(chunk))) > 0) {
+            size_t copy = (size_t)n;
+            if (copy > outsz - 1 - used) copy = outsz - 1 - used;
+            if (copy) {
+                memcpy(out + used, chunk, copy);
+                used += copy;
+                out[used] = '\0';
+            }
+        }
+
+        pid_t rc = waitpid(child, &status, WNOHANG);
+        if (rc == child) {
+            child_done = 1;
+            break;
+        }
+        if (rc < 0 && errno != EINTR) {
+            wait_error = 1;
+            child_done = 1;
+            break;
+        }
+
+        int64_t remaining = deadline - monotonic_ms();
+        if (remaining <= 0 || !running) {
+            timed_out = 1;
+            break;
+        }
+        int wait_ms = remaining > 50 ? 50 : (int)remaining;
+        struct pollfd pfd = {.fd = pipefd[0], .events = POLLIN};
+        (void)poll(&pfd, 1, wait_ms);
     }
 
-    int status = 0;
-    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) out[0] = '\0';
+    if (!child_done) terminate_and_reap(child);
+
+    char chunk[1024];
+    ssize_t n;
+    while ((n = read(pipefd[0], chunk, sizeof(chunk))) > 0) {
+        size_t copy = (size_t)n;
+        if (copy > outsz - 1 - used) copy = outsz - 1 - used;
+        if (copy) {
+            memcpy(out + used, chunk, copy);
+            used += copy;
+            out[used] = '\0';
+        }
+    }
+    close(pipefd[0]);
+
+    if (timed_out || wait_error || !child_done || !WIFEXITED(status) ||
+        (require_zero && WEXITSTATUS(status) != 0)) {
+        out[0] = '\0';
+        return 0;
+    }
+    trim(out);
+    return out[0] != '\0';
+}
+
+static int inspect_container_runtime(const char *runtime, const char *id, char *out, size_t outsz) {
+    out[0] = '\0';
+    if (!strict_container_id(id)) return 0;
+    int timeout_ms = CONTAINER_INSPECT_TIMEOUT_MS;
+    if (container_command_deadline_mono_ms > 0) {
+        int64_t remaining = container_command_deadline_mono_ms - monotonic_ms();
+        if (remaining <= 0) return 0;
+        if (remaining < timeout_ms) timeout_ms = (int)remaining;
+    }
+    char *const argv[] = {(char *)runtime, "inspect", "--format", "{{.Name}}", (char *)id, NULL};
+    if (!run_command_capture(argv, 0, 1, timeout_ms, out, outsz)) return 0;
     while (out[0] == '/') memmove(out, out + 1, strlen(out));
     return out[0] != '\0';
 }
@@ -285,7 +457,7 @@ static void resolve_container_name(const char *id, char *out, size_t outsz) {
     out[0] = '\0';
     if (!strict_container_id(id)) return;
 
-    int64_t now = now_ms();
+    int64_t now = monotonic_ms();
     int slot = -1;
     int oldest = 0;
     for (int i = 0; i < container_cache_count; i++) {
@@ -303,7 +475,12 @@ static void resolve_container_name(const char *id, char *out, size_t outsz) {
     }
 
     char resolved[256] = "";
+    if (container_command_deadline_mono_ms > 0 && now >= container_command_deadline_mono_ms) return;
     resolve_container_name_uncached(id, resolved, sizeof(resolved));
+
+    // A cycle deadline can prevent trying every runtime. Do not negative-cache
+    // that incomplete lookup; a later bounded cycle may resolve it.
+    if (!resolved[0] && container_command_deadline_mono_ms > 0) return;
 
     if (slot < 0) {
         if (container_cache_count < MAX_CONTAINER_CACHE) slot = container_cache_count++;
@@ -330,6 +507,13 @@ static int device_matches_dev_id(const device_t *d, dev_t dev_id) {
     return 0;
 }
 
+static int device_has_known_dev_id(const device_t *d) {
+    for (int i = 0; i < d->mount_count; i++) {
+        if (d->mount_dev_ids[i] != 0) return 1;
+    }
+    return 0;
+}
+
 static void logical_label_for_device(const device_t *d, char *out, size_t outsz) {
     out[0] = '\0';
     for (int i = 0; i < d->mount_count; i++) {
@@ -348,14 +532,16 @@ static void logical_label_for_device(const device_t *d, char *out, size_t outsz)
 }
 
 static int find_device_for_path_or_stat(const char *path, const struct stat *stp) {
-    for (int i = 0; i < device_count; i++) {
-        for (int m = 0; m < devices[i].mount_count; m++) {
-            if (path_matches_mount(path, devices[i].mounts[m])) return i;
-        }
-    }
     if (stp) {
         for (int i = 0; i < device_count; i++) {
             if (device_matches_dev_id(&devices[i], stp->st_dev)) return i;
+        }
+    }
+    for (int i = 0; i < device_count; i++) {
+        for (int m = 0; m < devices[i].mount_count; m++) {
+            if (!path_matches_mount(path, devices[i].mounts[m])) continue;
+            if (stp && device_has_known_dev_id(&devices[i])) continue;
+            return i;
         }
     }
     return -1;
@@ -374,27 +560,35 @@ static const char *mask_name(uint64_t mask) {
 static void clear_candidate(device_t *d) {
     memset(&d->candidate, 0, sizeof(d->candidate));
     d->ambiguous_count = 0;
+    d->uncertain_evidence[0] = '\0';
+}
+
+static void clear_recent_events(device_t *d) {
+    memset(d->recent_events, 0, sizeof(d->recent_events));
+    d->recent_event_count = 0;
+    d->recent_event_overflow_mono_ms = 0;
 }
 
 static void clear_wake_window(device_t *d) {
-    memset(&d->recent_event, 0, sizeof(d->recent_event));
+    clear_recent_events(d);
     clear_candidate(d);
     d->io_pending = 0;
     d->io_onset_ms = 0;
+    d->io_onset_mono_ms = 0;
 }
 
 static void fill_candidate(candidate_t *c, pid_t pid, uint64_t mask, const char *path,
                            const char *confidence, const char *evidence) {
     memset(c, 0, sizeof(*c));
     c->valid = 1;
-    c->ts_ms = now_ms();
+    c->ts_ms = realtime_ms();
+    c->mono_ms = monotonic_ms();
     c->pid = pid;
     snprintf(c->event, sizeof(c->event), "%s", mask_name(mask));
     snprintf(c->path, sizeof(c->path), "%s", path);
     read_proc_text(pid, "comm", c->comm, sizeof(c->comm));
     read_proc_exe(pid, c->exe, sizeof(c->exe));
     get_container_id(pid, c->container_id, sizeof(c->container_id));
-    resolve_container_name(c->container_id, c->container, sizeof(c->container));
     snprintf(c->confidence, sizeof(c->confidence), "%s", confidence);
     snprintf(c->evidence, sizeof(c->evidence), "%s", evidence);
 }
@@ -406,10 +600,10 @@ static int is_user_share_path(const char *path) {
 static void capture_user_share_event(pid_t pid, uint64_t mask, const char *path) {
     if (!tracking_enabled || pid <= 0 || pid == getpid() || !is_user_share_path(path)) return;
 
-    int64_t now = now_ms();
+    int64_t now = monotonic_ms();
     int keep = 0;
     for (int i = 0; i < user_share_event_count; i++) {
-        int64_t age = now - user_share_events[i].ts_ms;
+        int64_t age = now - user_share_events[i].mono_ms;
         if (age >= 0 && age <= PRE_IO_CORRELATION_MS) {
             if (keep != i) user_share_events[keep] = user_share_events[i];
             keep++;
@@ -417,7 +611,15 @@ static void capture_user_share_event(pid_t pid, uint64_t mask, const char *path)
     }
     user_share_event_count = keep;
 
+    for (int i = 0; i < user_share_event_count; i++) {
+        if (user_share_events[i].pid == pid) {
+            fill_candidate(&user_share_events[i], pid, mask, path, "high", "fanotify_user_share");
+            return;
+        }
+    }
+
     if (user_share_event_count >= MAX_USER_SHARE_EVENTS) {
+        user_share_overflow_mono_ms = now;
         memmove(&user_share_events[0], &user_share_events[1],
                 sizeof(user_share_events[0]) * (MAX_USER_SHARE_EVENTS - 1));
         user_share_event_count = MAX_USER_SHARE_EVENTS - 1;
@@ -436,9 +638,19 @@ static int select_user_share_candidate(int64_t io_ts, candidate_t *out, int *amb
     candidate_t latest;
     memset(&latest, 0, sizeof(latest));
 
+    if (io_ts <= fanotify_poisoned_until_mono_ms) {
+        if (ambiguous) *ambiguous = 0;
+        return 0;
+    }
+    if (io_ts - user_share_overflow_mono_ms >= 0 &&
+        io_ts - user_share_overflow_mono_ms <= PRE_IO_CORRELATION_MS) {
+        if (ambiguous) *ambiguous = MAX_USER_SHARE_EVENTS + 1;
+        return 0;
+    }
+
     for (int i = 0; i < user_share_event_count; i++) {
         candidate_t *c = &user_share_events[i];
-        int64_t age = io_ts - c->ts_ms;
+        int64_t age = io_ts - c->mono_ms;
         if (age < 0 || age > PRE_IO_CORRELATION_MS) continue;
 
         int seen = 0;
@@ -446,7 +658,7 @@ static int select_user_share_candidate(int64_t io_ts, candidate_t *out, int *amb
             if (pids[p] == c->pid) { seen = 1; break; }
         }
         if (!seen && pid_count < MAX_USER_SHARE_EVENTS) pids[pid_count++] = c->pid;
-        if (!latest.valid || c->ts_ms > latest.ts_ms) latest = *c;
+        if (!latest.valid || c->mono_ms > latest.mono_ms) latest = *c;
     }
 
     if (ambiguous) *ambiguous = pid_count;
@@ -457,11 +669,15 @@ static int select_user_share_candidate(int64_t io_ts, candidate_t *out, int *amb
     return 0;
 }
 
-static void capture_recent_event(device_t *d, pid_t pid, uint64_t mask, const char *path) {
+static void capture_recent_event(device_t *d, pid_t pid, uint64_t mask, const char *path,
+                                 const struct stat *stp) {
     if (!tracking_enabled || pid <= 0 || pid == getpid()) return;
-    int matches = 0;
-    for (int i = 0; i < d->mount_count; i++) {
-        if (path_matches_mount(path, d->mounts[i])) { matches = 1; break; }
+    int matches = stp && device_matches_dev_id(d, stp->st_dev);
+    if (!matches && stp && device_has_known_dev_id(d)) return;
+    if (!matches) {
+        for (int i = 0; i < d->mount_count; i++) {
+            if (path_matches_mount(path, d->mounts[i])) { matches = 1; break; }
+        }
     }
     if (!matches) return;
     if (trace_events) {
@@ -470,38 +686,127 @@ static void capture_recent_event(device_t *d, pid_t pid, uint64_t mask, const ch
     }
     if (d->state != PWR_STANDBY || d->io_pending) return;
 
-    candidate_t *c = &d->recent_event;
+    int64_t now = monotonic_ms();
+    int keep = 0;
+    for (int i = 0; i < d->recent_event_count; i++) {
+        int64_t age = now - d->recent_events[i].mono_ms;
+        if (age >= 0 && age <= PRE_IO_CORRELATION_MS) {
+            if (keep != i) d->recent_events[keep] = d->recent_events[i];
+            keep++;
+        }
+    }
+    d->recent_event_count = keep;
+
+    for (int i = 0; i < d->recent_event_count; i++) {
+        if (d->recent_events[i].pid == pid) {
+            fill_candidate(&d->recent_events[i], pid, mask, path, "high", "fanotify");
+            return;
+        }
+    }
+
+    if (d->recent_event_count >= MAX_DIRECT_EVENTS) {
+        d->recent_event_overflow_mono_ms = now;
+        memmove(&d->recent_events[0], &d->recent_events[1],
+                sizeof(d->recent_events[0]) * (MAX_DIRECT_EVENTS - 1));
+        d->recent_event_count = MAX_DIRECT_EVENTS - 1;
+    }
+    fill_candidate(&d->recent_events[d->recent_event_count++], pid, mask, path,
+                   "high", "fanotify");
+}
+
+static int select_direct_candidate(device_t *d, int64_t io_mono_ms,
+                                   candidate_t *out, int *ambiguous) {
+    if (ambiguous) *ambiguous = 0;
+    if (io_mono_ms <= fanotify_poisoned_until_mono_ms) {
+        snprintf(d->uncertain_evidence, sizeof(d->uncertain_evidence), "fanotify_overflow");
+        return 0;
+    }
+    if (io_mono_ms - d->recent_event_overflow_mono_ms >= 0 &&
+        io_mono_ms - d->recent_event_overflow_mono_ms <= PRE_IO_CORRELATION_MS) {
+        if (ambiguous) *ambiguous = MAX_DIRECT_EVENTS + 1;
+        snprintf(d->uncertain_evidence, sizeof(d->uncertain_evidence), "fanotify_ambiguous");
+        return 0;
+    }
+
+    pid_t pids[MAX_DIRECT_EVENTS];
+    int pid_count = 0;
+    candidate_t latest;
+    memset(&latest, 0, sizeof(latest));
+    for (int i = 0; i < d->recent_event_count; i++) {
+        candidate_t *c = &d->recent_events[i];
+        int64_t age = io_mono_ms - c->mono_ms;
+        if (age < 0 || age > PRE_IO_CORRELATION_MS) continue;
+        int seen = 0;
+        for (int p = 0; p < pid_count; p++) {
+            if (pids[p] == c->pid) { seen = 1; break; }
+        }
+        if (!seen) pids[pid_count++] = c->pid;
+        if (!latest.valid || c->mono_ms > latest.mono_ms) latest = *c;
+    }
+    if (ambiguous) *ambiguous = pid_count;
+    if (pid_count == 1 && latest.valid) {
+        *out = latest;
+        return 1;
+    }
+    if (pid_count > 1) {
+        snprintf(d->uncertain_evidence, sizeof(d->uncertain_evidence), "fanotify_ambiguous");
+    }
+    return 0;
+}
+
+static int candidate_is_shfs(const candidate_t *c) {
+    if (!c || !c->valid) return 0;
+    if (!strcmp(c->comm, "shfs")) return 1;
+    const char *base = strrchr(c->exe, '/');
+    base = base ? base + 1 : c->exe;
+    return !strcmp(base, "shfs");
+}
+
+static void fill_open_fd_candidate(candidate_t *c, pid_t pid, const char *path,
+                                   int64_t real_ts, int64_t mono_ts) {
     memset(c, 0, sizeof(*c));
     c->valid = 1;
-    c->ts_ms = now_ms();
+    c->ts_ms = real_ts;
+    c->mono_ms = mono_ts;
     c->pid = pid;
-    snprintf(c->event, sizeof(c->event), "%s", mask_name(mask));
+    snprintf(c->event, sizeof(c->event), "OPEN_FD");
     snprintf(c->path, sizeof(c->path), "%s", path);
     read_proc_text(pid, "comm", c->comm, sizeof(c->comm));
     read_proc_exe(pid, c->exe, sizeof(c->exe));
     get_container_id(pid, c->container_id, sizeof(c->container_id));
     resolve_container_name(c->container_id, c->container, sizeof(c->container));
-    snprintf(c->confidence, sizeof(c->confidence), "high");
-    snprintf(c->evidence, sizeof(c->evidence), "fanotify");
+    snprintf(c->confidence, sizeof(c->confidence), "medium");
+    snprintf(c->evidence, sizeof(c->evidence), "open_fd_unique");
 }
 
-static int capture_open_fd_candidate(device_t *d, int64_t t) {
+static int capture_open_fd_candidate(device_t *d, int64_t real_ts, int64_t mono_ts) {
     if (!tracking_enabled) return 0;
     DIR *proc = opendir("/proc");
     if (!proc) return 0;
 
     candidate_t unique;
     memset(&unique, 0, sizeof(unique));
-    pid_t identities[MAX_OPEN_IDENTITIES];
     int identity_count = 0;
+    int pids_scanned = 0;
+    int fds_scanned = 0;
+    int scan_limited = 0;
+    int64_t deadline = monotonic_ms() + OPEN_FD_ATTRIBUTION_BUDGET_MS;
+    if (open_fd_cycle_deadline_mono_ms > 0 && open_fd_cycle_deadline_mono_ms < deadline) {
+        deadline = open_fd_cycle_deadline_mono_ms;
+    }
     struct dirent *pe;
 
     while ((pe = readdir(proc)) != NULL) {
+        if (pids_scanned >= OPEN_FD_ATTRIBUTION_MAX_PIDS || monotonic_ms() >= deadline) {
+            scan_limited = 1;
+            break;
+        }
         char *end = NULL;
         long parsed = strtol(pe->d_name, &end, 10);
         if (!pe->d_name[0] || !end || *end || parsed <= 0 || parsed > INT_MAX) continue;
         pid_t pid = (pid_t)parsed;
         if (pid == getpid()) continue;
+        pids_scanned++;
 
         char fd_dir_path[128];
         snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", pid);
@@ -514,6 +819,11 @@ static int capture_open_fd_candidate(device_t *d, int64_t t) {
         struct dirent *fe;
         while ((fe = readdir(fd_dir)) != NULL) {
             if (fe->d_name[0] == '.') continue;
+            if (fds_scanned >= OPEN_FD_ATTRIBUTION_MAX_FDS || monotonic_ms() >= deadline) {
+                scan_limited = 1;
+                break;
+            }
+            fds_scanned++;
             char fd_path[160], target[STR_PATH];
             snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%.31s", pid, fe->d_name);
             ssize_t n = readlink(fd_path, target, sizeof(target) - 1);
@@ -523,6 +833,7 @@ static int capture_open_fd_candidate(device_t *d, int64_t t) {
             if (stat(fd_path, &st) != 0) continue;
             if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) continue;
             if (!device_matches_dev_id(d, st.st_dev)) {
+                if (device_has_known_dev_id(d)) continue;
                 int prefix_match = 0;
                 for (int m = 0; m < d->mount_count; m++) {
                     if (path_matches_mount(target, d->mounts[m])) { prefix_match = 1; break; }
@@ -531,43 +842,48 @@ static int capture_open_fd_candidate(device_t *d, int64_t t) {
             }
 
             current.valid = 1;
-            current.ts_ms = t;
+            current.ts_ms = real_ts;
+            current.mono_ms = mono_ts;
             current.pid = pid;
-            snprintf(current.event, sizeof(current.event), "OPEN_FD");
             snprintf(current.path, sizeof(current.path), "%s", target);
-            read_proc_text(pid, "comm", current.comm, sizeof(current.comm));
-            read_proc_exe(pid, current.exe, sizeof(current.exe));
-            get_container_id(pid, current.container_id, sizeof(current.container_id));
-            resolve_container_name(current.container_id, current.container, sizeof(current.container));
-            snprintf(current.confidence, sizeof(current.confidence), "medium");
-            snprintf(current.evidence, sizeof(current.evidence), "open_fd_unique");
             matched_pid = 1;
             break;
         }
         closedir(fd_dir);
 
+        if (scan_limited) break;
+
         if (matched_pid) {
-            int seen = 0;
-            for (int i = 0; i < identity_count; i++) if (identities[i] == pid) { seen = 1; break; }
-            if (!seen && identity_count < MAX_OPEN_IDENTITIES) {
-                identities[identity_count++] = pid;
-                if (identity_count == 1) unique = current;
-                else if (identity_count > 1) unique.valid = 0;
+            identity_count++;
+            if (identity_count == 1) unique = current;
+            else unique.valid = 0;
+            if (identity_count >= MAX_OPEN_IDENTITIES) {
+                scan_limited = 1;
+                break;
             }
         }
     }
     closedir(proc);
 
+    if (scan_limited) {
+        d->ambiguous_count = identity_count;
+        snprintf(d->uncertain_evidence, sizeof(d->uncertain_evidence), "open_fd_scan_limited");
+        return 0;
+    }
     if (identity_count == 1 && unique.valid) {
-        d->candidate = unique;
+        fill_open_fd_candidate(&d->candidate, unique.pid, unique.path, real_ts, mono_ts);
         d->ambiguous_count = 0;
+        d->uncertain_evidence[0] = '\0';
         return 1;
     }
     d->ambiguous_count = identity_count;
+    if (identity_count > 1) {
+        snprintf(d->uncertain_evidence, sizeof(d->uncertain_evidence), "open_fd_ambiguous");
+    }
     return 0;
 }
 
-static void observe_io_tick(device_t *d, uint64_t ticks, int64_t t) {
+static void observe_io_tick(device_t *d, uint64_t ticks, int64_t real_ts, int64_t mono_ts) {
     if (!d->io_initialized) {
         d->prev_io_ticks = ticks;
         d->io_initialized = 1;
@@ -576,28 +892,45 @@ static void observe_io_tick(device_t *d, uint64_t ticks, int64_t t) {
 
     if (d->state == PWR_STANDBY && !d->io_pending && ticks > d->prev_io_ticks) {
         d->io_pending = 1;
-        d->io_onset_ms = t;
+        d->io_onset_ms = real_ts;
+        d->io_onset_mono_ms = mono_ts;
         clear_candidate(d);
 
-        if (d->recent_event.valid) {
-            int64_t age = t - d->recent_event.ts_ms;
-            if (age >= 0 && age <= PRE_IO_CORRELATION_MS) d->candidate = d->recent_event;
+        candidate_t direct_candidate;
+        memset(&direct_candidate, 0, sizeof(direct_candidate));
+        int direct_ambiguous = 0;
+        int have_direct = tracking_enabled &&
+                          select_direct_candidate(d, mono_ts, &direct_candidate, &direct_ambiguous);
+        if (direct_ambiguous > 1) {
+            d->ambiguous_count = direct_ambiguous;
         }
 
-        if (tracking_enabled && !d->candidate.valid) {
+        if (tracking_enabled && d->ambiguous_count <= 1 &&
+            (!have_direct || candidate_is_shfs(&direct_candidate))) {
             candidate_t shared_candidate;
             memset(&shared_candidate, 0, sizeof(shared_candidate));
             int shared_ambiguous = 0;
-            if (select_user_share_candidate(t, &shared_candidate, &shared_ambiguous)) {
+            if (select_user_share_candidate(mono_ts, &shared_candidate, &shared_ambiguous)) {
                 d->candidate = shared_candidate;
                 d->ambiguous_count = 0;
             } else if (shared_ambiguous > 1) {
                 d->ambiguous_count = shared_ambiguous;
+                snprintf(d->uncertain_evidence, sizeof(d->uncertain_evidence),
+                         "fanotify_user_share_ambiguous");
+            } else if (have_direct) {
+                d->candidate = direct_candidate;
             }
+        } else if (have_direct) {
+            d->candidate = direct_candidate;
         }
 
         if (tracking_enabled && !d->candidate.valid && d->ambiguous_count <= 1) {
-            capture_open_fd_candidate(d, t);
+            capture_open_fd_candidate(d, real_ts, mono_ts);
+        }
+
+        if (d->candidate.valid && d->candidate.container_id[0] && !d->candidate.container[0]) {
+            resolve_container_name(d->candidate.container_id, d->candidate.container,
+                                   sizeof(d->candidate.container));
         }
 
         if (verbose) {
@@ -615,7 +948,10 @@ static void sample_diskstats(void) {
     FILE *fp = fopen("/proc/diskstats", "r");
     if (!fp) return;
     char line[1024];
-    int64_t t = now_ms();
+    int64_t real_ts = realtime_ms();
+    int64_t mono_ts = monotonic_ms();
+    open_fd_cycle_deadline_mono_ms = mono_ts + OPEN_FD_ATTRIBUTION_CYCLE_BUDGET_MS;
+    container_command_deadline_mono_ms = open_fd_cycle_deadline_mono_ms;
     while (fgets(line, sizeof(line), fp)) {
         char work[1024];
         snprintf(work, sizeof(work), "%s", line);
@@ -633,9 +969,11 @@ static void sample_diskstats(void) {
         }
         if (!have_ticks || !dev[0]) continue;
         int idx = find_device(dev);
-        if (idx >= 0) observe_io_tick(&devices[idx], ticks, t);
+        if (idx >= 0) observe_io_tick(&devices[idx], ticks, real_ts, mono_ts);
     }
     fclose(fp);
+    open_fd_cycle_deadline_mono_ms = 0;
+    container_command_deadline_mono_ms = 0;
 }
 
 static void load_runtime_config(void) {
@@ -762,13 +1100,11 @@ static power_state_t query_unraid_power(const char *dev) {
 }
 
 static power_state_t query_smartctl_power(const char *dev) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "LC_ALL=C smartctl -n standby -i /dev/%.63s 2>&1", dev);
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return PWR_UNKNOWN;
-    char out[8192]; size_t used = 0; out[0] = '\0';
-    while (used + 1 < sizeof(out) && fgets(out + used, (int)(sizeof(out) - used), fp)) used = strlen(out);
-    pclose(fp);
+    char device_path[96];
+    snprintf(device_path, sizeof(device_path), "/dev/%.63s", dev);
+    char out[8192];
+    char *const argv[] = {"smartctl", "-n", "standby", "-i", device_path, NULL};
+    if (!run_command_capture(argv, 1, 0, SMARTCTL_TIMEOUT_MS, out, sizeof(out))) return PWR_UNKNOWN;
     for (char *p = out; *p; p++) *p = (char)toupper((unsigned char)*p);
     if (strstr(out, "STANDBY") || strstr(out, "SLEEP")) return PWR_STANDBY;
     if (strstr(out, "ACTIVE") || strstr(out, "IDLE") || strstr(out, "START OF INFORMATION") || strstr(out, "DEVICE MODEL") || strstr(out, "PRODUCT:")) return PWR_ACTIVE;
@@ -824,23 +1160,45 @@ static void prune_history(void) {
         return;
     }
 
-    int64_t cutoff = now_ms() - (int64_t)HISTORY_DAYS * 86400000LL;
+    int allocation_ok = 1;
+    int64_t cutoff = realtime_ms() - (int64_t)HISTORY_DAYS * 86400000LL;
     char *line = NULL;
     size_t n = 0;
+    errno = 0;
     while (getline(&line, &n, fp) >= 0) {
         int64_t ts = extract_json_ts(line);
         if (ts && ts < cutoff) continue;
         if (count == cap) {
+            if (cap > SIZE_MAX / 2 / sizeof(char *)) {
+                allocation_ok = 0;
+                break;
+            }
             size_t newcap = cap * 2;
             char **tmp_lines = realloc(lines, newcap * sizeof(char *));
-            if (!tmp_lines) break;
+            if (!tmp_lines) {
+                allocation_ok = 0;
+                break;
+            }
             lines = tmp_lines;
             cap = newcap;
         }
-        lines[count++] = strdup(line);
+        lines[count] = strdup(line);
+        if (!lines[count]) {
+            allocation_ok = 0;
+            break;
+        }
+        count++;
     }
+    if (ferror(fp) || errno == ENOMEM) allocation_ok = 0;
     free(line);
     fclose(fp);
+
+    if (!allocation_ok) {
+        for (size_t i = 0; i < count; i++) free(lines[i]);
+        free(lines);
+        release_history_lock(lockfd);
+        return;
+    }
 
     size_t start = count > (size_t)HISTORY_MAX ? count - (size_t)HISTORY_MAX : 0;
     char tmp_path[STR_PATH + 64];
@@ -902,6 +1260,7 @@ static void append_wake_event(device_t *d, int64_t detected_ms) {
     fputs("\",\"confidence\":\"", fp); json_escape(fp, c->valid && c->confidence[0] ? c->confidence : "unknown");
     fputs("\",\"evidence\":\"", fp);
     if (c->valid && c->evidence[0]) json_escape(fp, c->evidence);
+    else if (d->uncertain_evidence[0]) json_escape(fp, d->uncertain_evidence);
     else if (d->ambiguous_count > 1) json_escape(fp, "open_fd_ambiguous");
     else json_escape(fp, "none");
     fprintf(fp, "\",\"ambiguous_candidates\":%d}\n", d->ambiguous_count);
@@ -917,7 +1276,7 @@ static void write_state_snapshot(void) {
     FILE *fp = fopen(tmp, "w");
     if (!fp) return;
     fprintf(fp, "{\"updated\":%lld,\"tracking\":%s,\"poll_seconds\":%d,\"detector\":\"",
-            (long long)now_ms(), tracking_enabled ? "true" : "false", poll_seconds);
+            (long long)realtime_ms(), tracking_enabled ? "true" : "false", poll_seconds);
     json_escape(fp, wake_detector);
     fputs("\",\"devices\":[", fp);
     for (int i = 0; i < device_count; i++) {
@@ -936,12 +1295,20 @@ static void write_state_snapshot(void) {
 }
 
 static void check_power_states(void) {
+    static int cursor = 0;
     load_runtime_config();
-    int64_t t = now_ms();
-    for (int i = 0; i < device_count; i++) {
-        device_t *d = &devices[i];
+    int checked = 0;
+    int start = device_count > 0 ? cursor % device_count : 0;
+    int64_t deadline = monotonic_ms() + POWER_CHECK_BUDGET_MS;
+    container_command_deadline_mono_ms = deadline;
+    while (checked < device_count) {
+        if (checked > 0 && monotonic_ms() >= deadline) break;
+        int idx = (start + checked) % device_count;
+        device_t *d = &devices[idx];
         power_state_t old = d->state;
         power_state_t cur = query_power(d->dev);
+        int64_t t = realtime_ms();
+        checked++;
         if (cur == PWR_UNKNOWN) continue;
         if (old == PWR_UNKNOWN) {
             d->state = cur;
@@ -960,6 +1327,8 @@ static void check_power_states(void) {
             d->state = cur;
         }
     }
+    if (device_count > 0) cursor = (start + checked) % device_count;
+    container_command_deadline_mono_ms = 0;
     write_state_snapshot();
 }
 
@@ -977,15 +1346,23 @@ static void write_open_files_snapshot(void) {
     open_file_t *files = calloc((size_t)open_files_limit, sizeof(open_file_t));
     if (!files) { fclose(out); unlink(tmp); return; }
     int count = 0, truncated = 0;
+    int pids_scanned = 0, fds_scanned = 0;
+    int64_t deadline = monotonic_ms() + OPEN_FILES_SCAN_BUDGET_MS;
+    container_command_deadline_mono_ms = deadline;
     DIR *proc = opendir("/proc");
     if (proc) {
         struct dirent *pe;
         while ((pe = readdir(proc)) != NULL) {
+            if (pids_scanned >= OPEN_FILES_SCAN_MAX_PIDS || monotonic_ms() >= deadline) {
+                truncated = 1;
+                break;
+            }
             char *end = NULL;
             long parsed = strtol(pe->d_name, &end, 10);
             if (!pe->d_name[0] || !end || *end || parsed <= 0 || parsed > INT_MAX) continue;
             pid_t pid = (pid_t)parsed;
             if (pid == getpid()) continue;
+            pids_scanned++;
             char fd_dir_path[128]; snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", pid);
             DIR *fd_dir = opendir(fd_dir_path); if (!fd_dir) continue;
             char comm[STR_SMALL] = "", exe[STR_MED] = "", cid[128] = "", cname[256] = "";
@@ -993,6 +1370,11 @@ static void write_open_files_snapshot(void) {
             struct dirent *fe;
             while ((fe = readdir(fd_dir)) != NULL) {
                 if (fe->d_name[0] == '.') continue;
+                if (fds_scanned >= OPEN_FILES_SCAN_MAX_FDS || monotonic_ms() >= deadline) {
+                    truncated = 1;
+                    break;
+                }
+                fds_scanned++;
                 char fd_path[160], target[STR_PATH];
                 snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%.31s", pid, fe->d_name);
                 ssize_t n = readlink(fd_path, target, sizeof(target) - 1);
@@ -1000,14 +1382,9 @@ static void write_open_files_snapshot(void) {
                 target[n] = '\0';
                 if (target[0] != '/') continue;
 
-                int idx = find_device_for_path_or_stat(target, NULL);
                 struct stat st;
-                if (idx < 0) {
-                    if (stat(fd_path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
-                    idx = find_device_for_path_or_stat(target, &st);
-                } else {
-                    if (stat(fd_path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
-                }
+                if (stat(fd_path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+                int idx = find_device_for_path_or_stat(target, &st);
                 if (idx < 0) continue;
                 if (open_file_duplicate(files, count, pid, target)) continue;
                 if (count >= open_files_limit) { truncated = 1; break; }
@@ -1036,7 +1413,7 @@ static void write_open_files_snapshot(void) {
     }
 
     fprintf(out, "{\"updated\":%lld,\"enabled\":true,\"truncated\":%s,\"files\":[",
-            (long long)now_ms(), truncated ? "true" : "false");
+            (long long)realtime_ms(), truncated ? "true" : "false");
     for (int i = 0; i < count; i++) {
         if (i) fputc(',', out);
         open_file_t *of = &files[i];
@@ -1053,6 +1430,7 @@ static void write_open_files_snapshot(void) {
     fputs("]}\n", out);
     fclose(out);
     free(files);
+    container_command_deadline_mono_ms = 0;
     rename(tmp, open_files_file);
 }
 
@@ -1102,8 +1480,28 @@ static int setup_fanotify(void) {
     return fd;
 }
 
+static void poison_fanotify_candidates(void) {
+    int64_t now = monotonic_ms();
+    fanotify_poisoned_until_mono_ms = now + PRE_IO_CORRELATION_MS;
+    memset(user_share_events, 0, sizeof(user_share_events));
+    user_share_event_count = 0;
+    user_share_overflow_mono_ms = 0;
+    for (int i = 0; i < device_count; i++) {
+        device_t *d = &devices[i];
+        clear_recent_events(d);
+        if (d->candidate.valid && !strncmp(d->candidate.evidence, "fanotify", 9)) {
+            memset(&d->candidate, 0, sizeof(d->candidate));
+            d->ambiguous_count = 0;
+            snprintf(d->uncertain_evidence, sizeof(d->uncertain_evidence), "fanotify_overflow");
+        }
+    }
+    if (verbose || trace_events) fprintf(stderr, "fanotify queue overflow; attribution window invalidated\n");
+}
+
 static void process_fanotify(int fanfd) {
     char buf[64 * 1024];
+    int processed = 0;
+    int64_t deadline = monotonic_ms() + FANOTIFY_PROCESS_BUDGET_MS;
     while (1) {
         ssize_t len = read(fanfd, buf, sizeof(buf));
         if (len < 0) {
@@ -1115,7 +1513,22 @@ static void process_fanotify(int fanfd) {
 
         struct fanotify_event_metadata *m = (struct fanotify_event_metadata *)buf;
         while (FAN_EVENT_OK(m, len)) {
+            if (processed >= FANOTIFY_PROCESS_MAX_EVENTS || monotonic_ms() >= deadline) {
+                poison_fanotify_candidates();
+                while (FAN_EVENT_OK(m, len)) {
+                    if (m->fd >= 0) close(m->fd);
+                    m = FAN_EVENT_NEXT(m, len);
+                }
+                return;
+            }
+            processed++;
             if (m->vers != FANOTIFY_METADATA_VERSION) break;
+            if (m->mask & FAN_Q_OVERFLOW) {
+                poison_fanotify_candidates();
+                if (m->fd >= 0) close(m->fd);
+                m = FAN_EVENT_NEXT(m, len);
+                continue;
+            }
             if (m->fd >= 0) {
                 char link[64], path[STR_PATH];
                 snprintf(link, sizeof(link), "/proc/self/fd/%d", m->fd);
@@ -1123,8 +1536,10 @@ static void process_fanotify(int fanfd) {
                 if (n > 0) {
                     path[n] = '\0';
                     capture_user_share_event(m->pid, m->mask, path);
+                    struct stat st;
+                    struct stat *stp = fstat(m->fd, &st) == 0 ? &st : NULL;
                     for (int i = 0; i < device_count; i++) {
-                        capture_recent_event(&devices[i], m->pid, m->mask, path);
+                        capture_recent_event(&devices[i], m->pid, m->mask, path, stp);
                     }
                 }
                 close(m->fd);
@@ -1165,7 +1580,7 @@ int main(int argc, char **argv) {
     if (test_open_fds_dev[0]) {
         int idx = find_device(test_open_fds_dev);
         if (idx < 0) return 5;
-        if (!capture_open_fd_candidate(&devices[idx], now_ms())) {
+        if (!capture_open_fd_candidate(&devices[idx], realtime_ms(), monotonic_ms())) {
             fprintf(stdout, "ambiguous=%d\n", devices[idx].ambiguous_count);
             return 6;
         }
@@ -1185,14 +1600,15 @@ int main(int argc, char **argv) {
     check_power_states();
     write_open_files_snapshot();
 
-    int64_t now = now_ms();
+    int64_t now = monotonic_ms();
     int64_t next_power = now + (int64_t)poll_seconds * 1000;
     int64_t next_io = now + IO_SAMPLE_MS;
     int64_t next_open = now + OPEN_FILES_SAMPLE_MS;
     int64_t next_prune = now + HISTORY_PRUNE_INTERVAL_MS;
 
     while (running) {
-        now = now_ms();
+        reap_pending_children();
+        now = monotonic_ms();
         int64_t wait_ms = next_io > now ? next_io - now : 0;
         int64_t d = next_power > now ? next_power - now : 0;
         if (d < wait_ms) wait_ms = d;
@@ -1212,7 +1628,7 @@ int main(int argc, char **argv) {
         }
         (void)rc;
 
-        now = now_ms();
+        now = monotonic_ms();
         if (reload_requested) {
             reload_requested = 0;
             load_runtime_config();
@@ -1221,25 +1637,26 @@ int main(int argc, char **argv) {
         }
         if (now >= next_io) {
             sample_diskstats();
-            next_io = now + IO_SAMPLE_MS;
+            next_io = monotonic_ms() + IO_SAMPLE_MS;
         }
         if (now >= next_power) {
             sample_diskstats();
             check_power_states();
-            next_power = now + (int64_t)poll_seconds * 1000;
+            next_power = monotonic_ms() + (int64_t)poll_seconds * 1000;
         }
         if (now >= next_open) {
             load_runtime_config();
             write_open_files_snapshot();
-            next_open = now + OPEN_FILES_SAMPLE_MS;
+            next_open = monotonic_ms() + OPEN_FILES_SAMPLE_MS;
         }
         if (now >= next_prune) {
             prune_history();
-            next_prune = now + HISTORY_PRUNE_INTERVAL_MS;
+            next_prune = monotonic_ms() + HISTORY_PRUNE_INTERVAL_MS;
         }
     }
 
     if (fanfd >= 0) close(fanfd);
+    reap_pending_children();
     unlink(open_files_file);
     return 0;
 }

@@ -10,6 +10,13 @@ $limit = isset($_GET['limit']) ? intval($_GET['limit']) : 300;
 $limit = max(1, min(2000, $limit));
 $nowMs = (int)round(microtime(true) * 1000);
 $dayMs = 86400000;
+$timeBucket = (int)floor($nowMs / 60000);
+
+function read_live_state(string $stateFile): ?array {
+    if (!is_readable($stateFile)) return null;
+    $state = json_decode(@file_get_contents($stateFile), true);
+    return is_array($state) ? $state : null;
+}
 
 $lock = @fopen($lockFile, 'c+');
 if ($lock) @flock($lock, LOCK_SH);
@@ -20,7 +27,10 @@ $sig = $stat ? ($stat['size'] . '|' . $stat['mtime']) : '0|0';
 $cached = null;
 if (is_readable($cacheFile)) {
     $cached = json_decode(@file_get_contents($cacheFile), true);
-    if (!is_array($cached) || ($cached['_sig'] ?? '') !== $sig || ($cached['_limit'] ?? 0) !== $limit) {
+    if (!is_array($cached)
+        || ($cached['_sig'] ?? '') !== $sig
+        || ($cached['_limit'] ?? 0) !== $limit
+        || ($cached['_bucket'] ?? -1) !== $timeBucket) {
         $cached = null;
     }
 }
@@ -29,7 +39,8 @@ if ($cached) {
         @flock($lock, LOCK_UN);
         fclose($lock);
     }
-    unset($cached['_sig'], $cached['_limit']);
+    unset($cached['_sig'], $cached['_limit'], $cached['_bucket']);
+    $cached['state'] = read_live_state($stateFile);
     $cached['now'] = $nowMs;
     echo json_encode($cached, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
@@ -136,11 +147,7 @@ usort($sourceList, function ($a, $b) {
     return $countCmp ?: (($b['last_ts'] ?? 0) <=> ($a['last_ts'] ?? 0));
 });
 
-$state = null;
-if (is_readable($stateFile)) {
-    $state = json_decode(@file_get_contents($stateFile), true);
-    if (!is_array($state)) $state = null;
-}
+$state = read_live_state($stateFile);
 
 $result = [
     'events' => array_reverse($eventsRing),
@@ -155,13 +162,17 @@ $result = [
 ];
 
 $toCache = $result;
+unset($toCache['state'], $toCache['now']);
 $toCache['_sig'] = $sig;
 $toCache['_limit'] = $limit;
-@file_put_contents(
-    $cacheFile . '.tmp',
-    json_encode($toCache, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
-    LOCK_EX
-);
-@rename($cacheFile . '.tmp', $cacheFile);
+$toCache['_bucket'] = $timeBucket;
+$cacheJson = json_encode($toCache, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+$cacheTmp = @tempnam(dirname($cacheFile), basename($cacheFile) . '.tmp.');
+if (is_string($cacheTmp)) {
+    if (is_string($cacheJson) && @file_put_contents($cacheTmp, $cacheJson, LOCK_EX) !== false) {
+        @rename($cacheTmp, $cacheFile);
+    }
+    @unlink($cacheTmp);
+}
 
 echo json_encode($result, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);

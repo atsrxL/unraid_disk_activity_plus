@@ -7,6 +7,12 @@ window.DiskActivityPlus = window.DiskActivityPlus || (function () {
     return node.innerHTML;
   }
 
+  function escapeAttribute(value) {
+    return escapeHtml(value)
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
   function actorLabel(entry) {
     var container = String((entry && entry.container) || '').trim();
     var process = String((entry && entry.process) || 'unknown').trim();
@@ -61,17 +67,27 @@ window.DiskActivityPlus = window.DiskActivityPlus || (function () {
     function stop() {
       stopped = true;
       clearTimeout(timer);
+      timer = null;
       if (request) request.abort();
       request = null;
     }
 
-    $(window).on('pagehide.diskActivityPlus beforeunload.diskActivityPlus', stop);
+    function start() {
+      stopped = false;
+      schedule(0);
+    }
+
+    $(window).on('pagehide.diskActivityPlus', stop);
+    $(window).on('pageshow.diskActivityPlus', function (event) {
+      var originalEvent = event.originalEvent || event;
+      if (originalEvent.persisted) start();
+    });
     $(document).on('visibilitychange.diskActivityPlus', function () {
       if (!document.hidden && !request) schedule(0);
     });
 
     return {
-      start: refresh,
+      start: start,
       refresh: function () { schedule(0); },
       stop: stop
     };
@@ -79,6 +95,7 @@ window.DiskActivityPlus = window.DiskActivityPlus || (function () {
 
   return {
     escapeHtml: escapeHtml,
+    escapeAttribute: escapeAttribute,
     actorLabel: actorLabel,
     formatTime: formatTime,
     createPoller: createPoller

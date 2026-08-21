@@ -2,15 +2,26 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "disk.activity">
   <!ENTITY author    "atsrxL / DerekChan65535">
-  <!ENTITY version   "2026.08.21.6">
+  <!ENTITY version   "2026.08.21.7">
   <!ENTITY launch    "Settings/DiskActivityPlus">
   <!ENTITY gitURL    "https://raw.githubusercontent.com/atsrxL/unraid_disk_activity_plus/main">
   <!ENTITY pluginURL "&gitURL;/disk.activity.plg">
   <!ENTITY txzURL    "https://github.com/atsrxL/unraid_disk_activity_plus/releases/download/v&version;/disk.activity-&version;.txz">
+  <!ENTITY md5       "b4a00f3a59a19d3f96d3e49b0a5e86c9">
   <!ENTITY support   "https://github.com/atsrxL/unraid_disk_activity_plus/issues">
 ]>
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="&support;" min="7.3.0" max="7.9.9">
 <CHANGES>
+###2026.08.21.7
+- Keep live disk/tracker state outside the history cache and refresh rolling statistics every minute
+- Prevent persistent WebGUI attribute injection from monitored file paths and restore BFCache polling
+- Require unique direct/user-share PIDs for HIGH attribution and treat shfs/overflow ambiguity conservatively
+- Bound container, smartctl and /proc work with monotonic deadlines so the monitor cannot freeze or busy-loop
+- Validate PID identity and serialize lifecycle operations to prevent duplicate monitors or unrelated kills
+- Build reproducible root-owned packages and enforce the package MD5 before upgradepkg runs
+- Keep the installed monitor online until the new artifact has downloaded, verified and installed successfully
+- Publish immutable releases only by explicit dispatch from the current main head
+
 ###2026.08.21.6
 - Simplify Reset Wake Statistics: keep POST/action confirmation and history locking, but remove CSRF validation because reset only clears this plugin's diagnostic history
 - Avoid false "invalid CSRF token" failures on Unraid WebGUI pages
@@ -53,28 +64,45 @@
 ###2026.08.21
 - First Disk Activity Plus release based on DerekChan65535/unraid-disk-activity 2026.06.08
 </CHANGES>
-<FILE Run="/bin/bash" Method="install">
-<INLINE><![CDATA[
-PLUGIN=/usr/local/emhttp/plugins/disk.activity
-if [ -x "$PLUGIN/scripts/rc.disk_activity" ]; then
-  "$PLUGIN/scripts/rc.disk_activity" stop >/dev/null 2>&1 || true
-fi
-# Pre-upgrade cleanup removes files from old packages/overlays before the new package is unpacked.
-rm -f "$PLUGIN/DiskActivitySettings.page" \
-      "$PLUGIN/DiskActivityColumn.page" \
-      "$PLUGIN/DiskActivityDashboard.page" \
-      "$PLUGIN/include/DiskActivity.php" \
-      "$PLUGIN/scripts/disk_activity" \
-      "$PLUGIN/assets/disk-activity.css"
-rm -f /var/local/emhttp/disk_activity.ini /var/local/emhttp/disk_activity.tmp /var/run/disk_activity.pid
-]]></INLINE>
-</FILE>
+<!-- Download, checksum and install first. The active monitor and old UI stay
+     intact if artifact retrieval or verification fails. -->
 <FILE Name="/boot/config/plugins/&name;/&name;-&version;.txz" Run="upgradepkg --install-new --reinstall">
 <URL>&txzURL;</URL>
+<MD5>&md5;</MD5>
 </FILE>
 <FILE Run="/bin/bash" Method="install">
 <INLINE><![CDATA[
+set -euo pipefail
 PLUGIN=/usr/local/emhttp/plugins/disk.activity
+required_files=(
+  "$PLUGIN/scripts/rc.disk_activity"
+  "$PLUGIN/scripts/disk_wake_tracker"
+  "$PLUGIN/bin/disk_wake_monitor"
+  "$PLUGIN/event/started/disk_activity_start"
+  "$PLUGIN/event/stopping_svcs/disk_activity_stop"
+)
+for required_file in "${required_files[@]}"; do
+  if [ ! -f "$required_file" ]; then
+    echo "disk.activity: installed package is missing $required_file" >&2
+    exit 1
+  fi
+done
+chmod +x "${required_files[@]}"
+for required_file in "${required_files[@]}"; do
+  if [ ! -x "$required_file" ]; then
+    echo "disk.activity: installed file is not executable: $required_file" >&2
+    exit 1
+  fi
+done
+if [ -e /proc/mdcmd ] && grep -q 'mdState=.*STARTED' /var/local/emhttp/var.ini 2>/dev/null; then
+  if ! "$PLUGIN/scripts/rc.disk_activity" restart; then
+    echo "disk.activity: installed monitor failed to restart; inspect /var/log/disk_wake_monitor.log" >&2
+    exit 1
+  fi
+elif ! "$PLUGIN/scripts/rc.disk_activity" stop; then
+  echo "disk.activity: installed monitor could not be stopped while the array is inactive" >&2
+  exit 1
+fi
 # Post-upgrade cleanup is intentional: earlier test overlays could leave files not owned by pkgtools.
 rm -f "$PLUGIN/DiskActivitySettings.page" \
       "$PLUGIN/DiskActivityColumn.page" \
@@ -83,8 +111,6 @@ rm -f "$PLUGIN/DiskActivitySettings.page" \
       "$PLUGIN/scripts/disk_activity" \
       "$PLUGIN/assets/disk-activity.css"
 rm -f /var/local/emhttp/disk_activity.ini /var/local/emhttp/disk_activity.tmp /var/run/disk_activity.pid
-chmod +x "$PLUGIN/scripts/rc.disk_activity" "$PLUGIN/scripts/disk_wake_tracker" "$PLUGIN/bin/disk_wake_monitor"
-chmod +x "$PLUGIN/event/started/disk_activity_start" "$PLUGIN/event/stopping_svcs/disk_activity_stop"
 mkdir -p /boot/config/plugins/disk.activity
 CFG=/boot/config/plugins/disk.activity/disk.activity.cfg
 if [ -f "$CFG" ]; then
@@ -96,28 +122,24 @@ if [ -f "$CFG" ]; then
     -e '/^history_max=/d' \
     "$CFG"
 fi
-if [ -e /proc/mdcmd ] && grep -q 'mdState=.*STARTED' /var/local/emhttp/var.ini 2>/dev/null; then
-  "$PLUGIN/scripts/rc.disk_activity" start >/dev/null 2>&1 || true
-fi
-cd /boot/config/plugins/disk.activity || exit 0
-shopt -s nullglob
-latest="$(printf '%s\n' disk.activity-*.txz | sort -V | tail -n 1)"
-for f in disk.activity-*.txz; do
-  [[ "$f" == "$latest" ]] || rm -f "$f"
-done
+# Keep previously downloaded txz files. Immutable older releases remain usable
+# for an explicit rollback instead of being deleted by a newer installation.
 ]]></INLINE>
 </FILE>
 <FILE Run="/bin/bash" Method="remove">
 <INLINE><![CDATA[
 if [ -x /usr/local/emhttp/plugins/disk.activity/scripts/rc.disk_activity ]; then
-  /usr/local/emhttp/plugins/disk.activity/scripts/rc.disk_activity stop >/dev/null 2>&1 || true
+  if ! /usr/local/emhttp/plugins/disk.activity/scripts/rc.disk_activity stop; then
+    echo "disk.activity: monitor could not be stopped safely; aborting removal" >&2
+    exit 1
+  fi
 fi
 for pkg in /var/log/packages/disk.activity-*; do
   [ -e "$pkg" ] || continue
   removepkg "$(basename "$pkg")" >/dev/null 2>&1 || true
 done
 rm -f /var/local/emhttp/disk_activity.ini /var/local/emhttp/disk_activity.tmp /var/run/disk_activity.pid
-rm -f /var/local/emhttp/disk_wake_state.json /var/local/emhttp/disk_wake_devices.tsv /var/local/emhttp/disk_open_files.json /var/local/emhttp/disk_wake_history_cache.json /var/run/disk_wake_monitor.pid /var/lock/disk_activity_plus_history.lock
+rm -f /var/local/emhttp/disk_wake_state.json /var/local/emhttp/disk_wake_devices.tsv /var/local/emhttp/disk_open_files.json /var/local/emhttp/disk_wake_history_cache.json /var/run/disk_wake_monitor.pid /var/lock/disk_activity_plus_history.lock /var/lock/disk_activity_plus.lifecycle.lock
 rm -rf /usr/local/emhttp/plugins/disk.activity
 rm -rf /boot/config/plugins/disk.activity
 ]]></INLINE>

@@ -8,8 +8,19 @@ function fail_json(int $status, string $message) {
     exit;
 }
 
+// Keep this endpoint usable across Unraid releases, reverse proxies and CLI
+// callers. Modern browsers explicitly label cross-site requests; reject only
+// that unambiguous case so a rewritten Host header cannot break the UI.
+function is_obvious_cross_origin(): bool {
+    $fetchSite = strtolower(trim((string)($_SERVER['HTTP_SEC_FETCH_SITE'] ?? '')));
+    return $fetchSite === 'cross-site';
+}
+
 if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
     fail_json(405, 'POST required');
+}
+if (is_obvious_cross_origin()) {
+    fail_json(403, 'Cross-origin request rejected');
 }
 
 $action = (string)($_POST['action'] ?? '');
@@ -48,6 +59,9 @@ if (!$ok) {
 
 @unlink($cacheFile);
 @unlink($cacheFile . '.tmp');
+foreach (@glob($cacheFile . '.tmp.*') ?: [] as $cacheTmp) {
+    @unlink($cacheTmp);
+}
 @flock($lock, LOCK_UN);
 fclose($lock);
 

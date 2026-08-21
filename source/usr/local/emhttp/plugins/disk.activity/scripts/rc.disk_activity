@@ -1,15 +1,21 @@
 #!/bin/bash
 # rc.disk_activity - Start/stop Disk Activity Plus wake/open-file monitor
+set -u
 
 WAKE=/usr/local/emhttp/plugins/disk.activity/scripts/disk_wake_tracker
+LEGACY_SCRIPT=/usr/local/emhttp/plugins/disk.activity/scripts/disk_activity
 LEGACY_PID=/var/run/disk_activity.pid
 LEGACY_INI=/var/local/emhttp/disk_activity.ini
 LEGACY_TMP=/var/local/emhttp/disk_activity.tmp
 
 cleanup_legacy_activity() {
+  local pid='' cmdline=''
   if [ -f "$LEGACY_PID" ]; then
     pid=$(cat "$LEGACY_PID" 2>/dev/null || true)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && [ -r "/proc/$pid/cmdline" ]; then
+      cmdline=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null || true)
+    fi
+    if [ -n "$cmdline" ] && grep -Fxq "$LEGACY_SCRIPT" <<<"$cmdline"; then
       kill "$pid" 2>/dev/null || true
     fi
   fi
@@ -18,23 +24,35 @@ cleanup_legacy_activity() {
 
 start() {
   cleanup_legacy_activity
-  [ -x "$WAKE" ] && "$WAKE" start
+  if [ ! -x "$WAKE" ]; then
+    echo "disk-activity: wake tracker launcher missing or not executable: $WAKE" >&2
+    return 1
+  fi
+  "$WAKE" start
 }
 
 stop() {
-  [ -x "$WAKE" ] && "$WAKE" stop
+  local rc=0
+  if [ -x "$WAKE" ]; then
+    "$WAKE" stop || rc=$?
+  fi
   cleanup_legacy_activity
+  return "$rc"
 }
 
 status() {
-  [ -x "$WAKE" ] && "$WAKE" status
+  if [ ! -x "$WAKE" ]; then
+    echo "disk-activity: wake tracker launcher missing or not executable: $WAKE" >&2
+    return 1
+  fi
+  "$WAKE" status
 }
 
-case "$1" in
+case "${1:-}" in
   start) start ;;
   stop) stop ;;
-  restart) stop; sleep 1; start ;;
+  restart) stop && { sleep 1; start; } ;;
   status) status ;;
-  remap) [ -x "$WAKE" ] && "$WAKE" remap ;;
-  *) echo "Usage: $0 start|stop|restart|status|remap" ;;
+  remap) [ -x "$WAKE" ] || { echo "disk-activity: wake tracker launcher missing or not executable: $WAKE" >&2; exit 1; }; "$WAKE" remap ;;
+  *) echo "Usage: $0 start|stop|restart|status|remap"; exit 2 ;;
 esac

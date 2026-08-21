@@ -6,6 +6,7 @@ PLUGIN=/usr/local/emhttp/plugins/disk.activity
 BIN="$PLUGIN/bin/disk_wake_monitor"
 MAP=/var/local/emhttp/disk_wake_devices.tsv
 PIDFILE=/var/run/disk_wake_monitor.pid
+LIFECYCLE_LOCK=/var/lock/disk_activity_plus.lifecycle.lock
 LOG=/var/log/disk_wake_monitor.log
 CFG=/boot/config/plugins/disk.activity/disk.activity.cfg
 HISTORY=/boot/config/plugins/disk.activity/wake-history.jsonl
@@ -14,6 +15,68 @@ OPENFILES=/var/local/emhttp/disk_open_files.json
 DISKS=/var/local/emhttp/disks.ini
 
 log() { echo "disk-wake: $*"; }
+
+PID_RECORD_PID=
+PID_RECORD_START=
+
+pid_start_time() {
+  local pid="$1" stat rest
+  IFS= read -r stat < "/proc/$pid/stat" 2>/dev/null || return 1
+  # Remove pid and the parenthesized comm field. starttime (field 22) is then
+  # field 20 in the remaining text.
+  rest="${stat##*) }"
+  awk '{print $20}' <<<"$rest"
+}
+
+load_pid_record() {
+  local extra=
+  PID_RECORD_PID=
+  PID_RECORD_START=
+  [ -s "$PIDFILE" ] || return 1
+  IFS=' ' read -r PID_RECORD_PID PID_RECORD_START extra < "$PIDFILE" || return 1
+  [[ "$PID_RECORD_PID" =~ ^[1-9][0-9]*$ ]] || return 1
+  [ -z "$extra" ] || return 1
+  if [ -n "$PID_RECORD_START" ]; then
+    [[ "$PID_RECORD_START" =~ ^[0-9]+$ ]] || return 1
+  fi
+}
+
+monitor_pid_matches() {
+  local pid="$1" expected_start="${2:-}" expected_exe actual_exe actual_start
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  expected_exe=$(readlink -f "$BIN" 2>/dev/null) || return 1
+  actual_exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 1
+  actual_exe="${actual_exe% (deleted)}"
+  [ "$actual_exe" = "$expected_exe" ] || return 1
+  if [ -n "$expected_start" ]; then
+    actual_start=$(pid_start_time "$pid") || return 1
+    [ "$actual_start" = "$expected_start" ] || return 1
+  fi
+}
+
+write_pid_record() {
+  local pid="$1" start="$2" tmp="${PIDFILE}.tmp.$$"
+  if ! printf '%s %s\n' "$pid" "$start" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 0644 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$PIDFILE"
+}
+
+find_monitor_pids() {
+  local expected_exe proc pid actual_exe
+  MONITOR_PIDS=()
+  expected_exe=$(readlink -f "$BIN" 2>/dev/null) || return 1
+  for proc in /proc/[0-9]*; do
+    [ -e "$proc/exe" ] || continue
+    pid="${proc##*/}"
+    actual_exe=$(readlink "$proc/exe" 2>/dev/null) || continue
+    actual_exe="${actual_exe% (deleted)}"
+    [ "$actual_exe" = "$expected_exe" ] && MONITOR_PIDS+=("$pid")
+  done
+  return 0
+}
 
 get_disk_map() {
   [ -s "$DISKS" ] || return 1
@@ -69,8 +132,15 @@ emit_zfs_mounts() {
 }
 
 generate_map() {
-  local tmp="${MAP}.tmp.$$" dev disk pool mp
-  : > "$tmp"
+  local tmp="${MAP}.tmp.$$" unique="${MAP}.unique.$$" inventory="${MAP}.inventory.$$"
+  local dev disk pool mp
+  [ -s "$DISKS" ] || { log "disk metadata is unavailable: $DISKS"; return 1; }
+  : > "$tmp" || { log "cannot create device map temporary file"; return 1; }
+  if ! get_disk_map > "$inventory"; then
+    rm -f "$tmp" "$inventory"
+    log "cannot read disk metadata from $DISKS"
+    return 1
+  fi
   while IFS=$'\t' read -r dev disk; do
     [ -b "/dev/$dev" ] || continue
     [ "$(cat "/sys/block/$dev/queue/rotational" 2>/dev/null)" = "1" ] || continue
@@ -82,66 +152,211 @@ generate_map() {
 
     pool=$(zpool_for_dev "$dev" 2>/dev/null || true)
     [ -n "$pool" ] && emit_zfs_mounts "$dev" "$disk" "$pool" >> "$tmp"
-  done < <(get_disk_map)
+  done < "$inventory"
+  rm -f "$inventory"
 
-  awk '!seen[$0]++' "$tmp" > "$MAP"
+  if ! awk '!seen[$0]++' "$tmp" > "$unique"; then
+    rm -f "$tmp" "$unique"
+    log "cannot finalize monitored-device map"
+    return 1
+  fi
   rm -f "$tmp"
-  if [ ! -s "$MAP" ]; then
-    log "no rotational mounted devices found; wake tracker not started"
+  if [ ! -s "$unique" ]; then
+    rm -f "$unique" "$MAP"
+    log "no mounted rotational devices found; monitor intentionally not started"
+    return 10
+  fi
+  if ! mv -f "$unique" "$MAP"; then
+    rm -f "$unique"
+    log "cannot install monitored-device map: $MAP"
     return 1
   fi
   return 0
 }
 
 start() {
-  if [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    log "already running (PID $(cat "$PIDFILE"))"
-    return 0
-  fi
-  rm -f "$PIDFILE"
-  [ -x "$BIN" ] || { log "monitor binary missing: $BIN"; return 1; }
-  mkdir -p /var/local/emhttp /boot/config/plugins/disk.activity
-  [ -e "$HISTORY" ] || : > "$HISTORY"
-  generate_map || return 0
+  local pid start_time rc i
+  [ -x "$BIN" ] || { log "monitor binary missing or not executable: $BIN"; return 1; }
+  mkdir -p /var/local/emhttp /var/run /var/lock /boot/config/plugins/disk.activity || {
+    log "cannot create runtime directories"
+    return 1
+  }
 
-  nohup "$BIN" --map "$MAP" --history "$HISTORY" --state "$STATE" --open-files "$OPENFILES" --config "$CFG" >>"$LOG" 2>&1 &
-  echo $! > "$PIDFILE"
-  sleep 0.05
-  if ! kill -0 "$!" 2>/dev/null; then
+  if load_pid_record; then
+    if monitor_pid_matches "$PID_RECORD_PID" "$PID_RECORD_START"; then
+      if [ -z "$PID_RECORD_START" ]; then
+        start_time=$(pid_start_time "$PID_RECORD_PID") || {
+          log "cannot strengthen legacy PID record for PID $PID_RECORD_PID"
+          return 1
+        }
+        write_pid_record "$PID_RECORD_PID" "$start_time" || {
+          log "cannot update legacy PID record for PID $PID_RECORD_PID"
+          return 1
+        }
+      fi
+      log "already running (PID $PID_RECORD_PID)"
+      return 0
+    fi
+    log "discarding stale PID file (recorded PID $PID_RECORD_PID is not this monitor)"
     rm -f "$PIDFILE"
-    log "monitor failed to start; see $LOG"
+  elif [ -e "$PIDFILE" ]; then
+    log "discarding invalid PID file"
+    rm -f "$PIDFILE"
+  fi
+
+  if ! find_monitor_pids; then
+    log "cannot inspect existing monitor processes"
     return 1
   fi
-  log "started (PID $!)"
+  if [ "${#MONITOR_PIDS[@]}" -gt 1 ]; then
+    log "multiple unmanaged monitor processes found (${MONITOR_PIDS[*]}); refusing to start another"
+    return 1
+  elif [ "${#MONITOR_PIDS[@]}" -eq 1 ]; then
+    pid="${MONITOR_PIDS[0]}"
+    start_time=$(pid_start_time "$pid") || {
+      log "cannot identify existing monitor PID $pid"
+      return 1
+    }
+    write_pid_record "$pid" "$start_time" || {
+      log "cannot adopt existing monitor PID $pid"
+      return 1
+    }
+    log "adopted already-running monitor (PID $pid)"
+    return 0
+  fi
+
+  [ -e "$HISTORY" ] || : > "$HISTORY" || {
+    log "cannot create wake history: $HISTORY"
+    return 1
+  }
+  generate_map
+  rc=$?
+  [ "$rc" -eq 0 ] || { [ "$rc" -eq 10 ] && return 0; return "$rc"; }
+
+  nohup "$BIN" --map "$MAP" --history "$HISTORY" --state "$STATE" --open-files "$OPENFILES" --config "$CFG" 9>&- >>"$LOG" 2>&1 &
+  pid=$!
+  start_time=
+  for ((i=0; i<20; i++)); do
+    if monitor_pid_matches "$pid"; then
+      start_time=$(pid_start_time "$pid" 2>/dev/null || true)
+      [ -n "$start_time" ] && break
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  if [ -z "$start_time" ] || ! monitor_pid_matches "$pid" "$start_time"; then
+    rc=1
+    if kill -0 "$pid" 2>/dev/null; then
+      # This is still our unreaped direct child, so it cannot be a reused PID.
+      kill "$pid" 2>/dev/null || true
+      for ((i=0; i<10; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+      if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid" 2>/dev/null || true; fi
+    fi
+    if wait "$pid" 2>/dev/null; then rc=0; else rc=$?; fi
+    log "monitor failed to start (exit $rc); see $LOG"
+    return 1
+  fi
+  if ! write_pid_record "$pid" "$start_time"; then
+    log "monitor started but PID file could not be written; stopping PID $pid"
+    if monitor_pid_matches "$pid" "$start_time"; then
+      kill "$pid" 2>/dev/null || true
+    fi
+    return 1
+  fi
+  log "started (PID $pid)"
 }
 
 stop() {
-  if [ -s "$PIDFILE" ]; then
-    local pid
-    pid=$(cat "$PIDFILE")
-    if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-      for _ in {1..20}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  local pid='' start_time='' i have_monitor=0
+  if load_pid_record; then
+    pid="$PID_RECORD_PID"
+    start_time="$PID_RECORD_START"
+    if monitor_pid_matches "$pid" "$start_time"; then
+      if [ -z "$start_time" ]; then
+        start_time=$(pid_start_time "$pid") || {
+          log "cannot establish monitor identity for PID $pid; no signal sent"
+          return 1
+        }
+      fi
+      have_monitor=1
+    else
+      log "stale PID file did not identify this monitor; no signal sent"
+      rm -f "$PIDFILE"
+    fi
+  elif [ -e "$PIDFILE" ]; then
+    log "invalid PID file did not identify this monitor; no signal sent"
+    rm -f "$PIDFILE"
+  fi
+
+  # A package replacement can leave the old executable running with no usable
+  # pidfile. Adopt exactly one same-path process, recording starttime before any
+  # signal. Multiple matches are never killed by name or pattern.
+  if [ "$have_monitor" -eq 0 ] && [ -e "$BIN" ]; then
+    if ! find_monitor_pids; then
+      log "cannot inspect unmanaged monitor processes; no signal sent"
+      return 1
+    fi
+    if [ "${#MONITOR_PIDS[@]}" -gt 1 ]; then
+      log "multiple unmanaged monitor processes found (${MONITOR_PIDS[*]}); no signal sent"
+      return 1
+    elif [ "${#MONITOR_PIDS[@]}" -eq 1 ]; then
+      pid="${MONITOR_PIDS[0]}"
+      start_time=$(pid_start_time "$pid") || {
+        log "cannot establish unmanaged monitor identity for PID $pid; no signal sent"
+        return 1
+      }
+      monitor_pid_matches "$pid" "$start_time" || {
+        log "unmanaged monitor identity changed before stop; no signal sent"
+        return 1
+      }
+      have_monitor=1
+      log "adopted unmanaged monitor PID $pid for safe shutdown"
+    fi
+  fi
+
+  if [ "$have_monitor" -eq 1 ]; then
+    kill "$pid" 2>/dev/null || true
+    for ((i=0; i<30; i++)); do
+      monitor_pid_matches "$pid" "$start_time" || break
+      sleep 0.1
+    done
+    # Revalidate both executable and process start time immediately before
+    # SIGKILL so a reused PID can never be killed from a stale pidfile.
+    if monitor_pid_matches "$pid" "$start_time"; then
       kill -9 "$pid" 2>/dev/null || true
+      for ((i=0; i<10; i++)); do
+        monitor_pid_matches "$pid" "$start_time" || break
+        sleep 0.05
+      done
+    fi
+    if monitor_pid_matches "$pid" "$start_time"; then
+      log "failed to stop monitor PID $pid"
+      return 1
     fi
   fi
   rm -f "$PIDFILE" "$STATE" "$MAP" "$OPENFILES"
 }
 
 status() {
-  if [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    echo "disk wake monitor is running (PID $(cat "$PIDFILE"))"
+  if load_pid_record && monitor_pid_matches "$PID_RECORD_PID" "$PID_RECORD_START"; then
+    echo "disk wake monitor is running (PID $PID_RECORD_PID)"
     [ -s "$STATE" ] && cat "$STATE"
   else
     echo "disk wake monitor is not running"
+    return 1
   fi
 }
+
+mkdir -p "$(dirname "$LIFECYCLE_LOCK")" || { log "cannot create lifecycle lock directory"; exit 1; }
+command -v flock >/dev/null 2>&1 || { log "required flock command is unavailable"; exit 1; }
+exec 9>"$LIFECYCLE_LOCK" || { log "cannot open lifecycle lock"; exit 1; }
+flock -w 15 9 || { log "timed out waiting for another lifecycle operation"; exit 1; }
 
 case "${1:-}" in
   start) start ;;
   stop) stop ;;
-  restart) stop; sleep 0.2; start ;;
-  remap) stop; start ;;
+  restart) stop && { sleep 0.2; start; } ;;
+  remap) stop && start ;;
   status) status ;;
   *) echo "Usage: $0 start|stop|restart|remap|status"; exit 2 ;;
 esac
