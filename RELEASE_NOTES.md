@@ -1,22 +1,31 @@
-## Disk Activity Plus 2026.08.21.4
+## Disk Activity Plus 2026.08.21.5
 
-This release removes the original Activity % subsystem and keeps Disk Activity Plus focused on HDD wake diagnostics.
+This release hardens the wake tracker and targets the largest remaining attribution gap: Docker/SMB accesses that go through Unraid user shares instead of directly through the underlying ZFS/physical mount path.
 
-### Removed
-- Main-page Activity % column injection.
-- Separate `disk_activity` daemon that sampled `/proc/diskstats` every 2 seconds.
-- Legacy `DiskActivity.php` API and Activity CSS.
-- Activity display-style and averaging-window settings.
+### Attribution improvements
+- Add best-effort fanotify watches for `/mnt/user` and `/mnt/user0`.
+- Correlate user-share events with the first real physical block-I/O onset.
+- Promote a user-share candidate to **HIGH** only when exactly one unique PID is observed in the 2-second correlation window; multiple plausible PIDs remain UNKNOWN.
+- Keep direct monitored-filesystem fanotify events as the strongest HIGH evidence.
+- Preserve the conservative unique-open-FD MEDIUM fallback.
 
-### Kept
-- HDD ACTIVE/STANDBY state tracking.
-- Physical STANDBY → ACTIVE wake history and per-disk statistics.
-- HIGH/MEDIUM/UNKNOWN process attribution.
-- Live open-file snapshots and Dashboard tile.
-- Reset Wake Statistics, bounded history retention, and RAM caching.
-- Lightweight `/proc/diskstats` checks inside the wake monitor remain only for correlating a candidate access with the first real block-I/O onset; this is separate from the removed Activity % sampler.
+### Security / robustness
+- Actually validate the current Unraid CSRF token before Reset Wake Statistics.
+- Replace shell-based Docker/Podman name lookup with `fork`/`exec` and strict 64-character hex container IDs.
+- Add bounded container-name TTL caching with eviction.
+- Coordinate history append, read, prune and reset through one shared lock.
+- Prune/reset history with atomic replacement so a crash cannot leave a half-truncated history file.
+- SIGHUP now requests a config reload instead of terminating the monitor.
 
-### Upgrade cleanup
-- Old Activity files are explicitly removed before and after package upgrade.
-- Stale `display=` and `window=` keys are removed from existing plugin configuration.
-- Legacy `DiskActivitySettings.page` cleanup remains in place so only the User Utilities entry is visible.
+### Simplified UI / retention
+- Remove the Dashboard Open Files tile; Open Files remains available inside the plugin troubleshooting page.
+- Fix wake-history retention at **60 days** and at most **5,000 events**.
+- Remove obsolete dashboard/history-retention settings from existing configs during upgrade.
+- Refactor repeated frontend helpers into a readable shared JavaScript asset.
+
+### Maintainability
+- Replace the seven numbered C source fragments with one normal `disk_wake_monitor.c` source file.
+- Add `--help` and `--version` to the native monitor.
+- Keep `-Wall -Wextra -Werror` compilation in the release build.
+
+`/proc/diskstats` is still read in RAM by the wake monitor only to confirm the first real physical-I/O onset; the old Activity % sampler remains removed.
