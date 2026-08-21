@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "disk.activity">
   <!ENTITY author    "atsrxL / DerekChan65535">
-  <!ENTITY version   "2026.08.21.2">
+  <!ENTITY version   "2026.08.21.3">
   <!ENTITY launch    "Settings/DiskActivityPlus">
   <!ENTITY gitURL    "https://raw.githubusercontent.com/atsrxL/unraid_disk_activity_plus/main">
   <!ENTITY pluginURL "&gitURL;/disk.activity.plg">
@@ -11,6 +11,10 @@
 ]>
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="&support;" min="7.3.0" max="7.9.9">
 <CHANGES>
+###2026.08.21.3
+- Remove legacy DiskActivitySettings.page during upgrade so only the User Utilities entry remains
+- Prevent old System Settings / Other Settings icons from surviving package upgrades
+
 ###2026.08.21.2
 - Fix blank Disk Activity Plus page by using the correct Unraid xmenu tab container
 - Keep a single Settings > User Utilities entry with Activity / Open Files and Wake History tabs
@@ -34,9 +38,13 @@
 </CHANGES>
 <FILE Run="/bin/bash" Method="install">
 <INLINE><![CDATA[
-if [ -x /usr/local/emhttp/plugins/disk.activity/scripts/rc.disk_activity ]; then
-  /usr/local/emhttp/plugins/disk.activity/scripts/rc.disk_activity stop >/dev/null 2>&1 || true
+PLUGIN=/usr/local/emhttp/plugins/disk.activity
+if [ -x "$PLUGIN/scripts/rc.disk_activity" ]; then
+  "$PLUGIN/scripts/rc.disk_activity" stop >/dev/null 2>&1 || true
 fi
+# Legacy page from <=2026.08.21.1 registered a second icon under Other/System Settings.
+# It may survive upgrades when it was installed by an earlier overlay/package, so remove it explicitly.
+rm -f "$PLUGIN/DiskActivitySettings.page"
 ]]></INLINE>
 </FILE>
 <FILE Name="/boot/config/plugins/&name;/&name;-&version;.txz" Run="upgradepkg --install-new --reinstall">
@@ -45,6 +53,8 @@ fi
 <FILE Run="/bin/bash" Method="install">
 <INLINE><![CDATA[
 PLUGIN=/usr/local/emhttp/plugins/disk.activity
+# Defensive cleanup after package install as well, in case the legacy page was unmanaged by Slackware pkgtools.
+rm -f "$PLUGIN/DiskActivitySettings.page"
 chmod +x "$PLUGIN/scripts/disk_activity" "$PLUGIN/scripts/rc.disk_activity" "$PLUGIN/scripts/disk_wake_tracker" "$PLUGIN/bin/disk_wake_monitor"
 chmod +x "$PLUGIN/event/started/disk_activity_start" "$PLUGIN/event/stopping_svcs/disk_activity_stop"
 mkdir -p /boot/config/plugins/disk.activity
