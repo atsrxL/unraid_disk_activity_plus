@@ -5,7 +5,6 @@ Icon="history"
 <?PHP
 $cssVersion = @filemtime('/usr/local/emhttp/plugins/disk.activity/assets/wake-history.css') ?: time();
 $jsVersion = @filemtime('/usr/local/emhttp/plugins/disk.activity/assets/disk-activity-plus.js') ?: time();
-$csrf = $var['csrf_token'] ?? '';
 ?>
 <link type="text/css" rel="stylesheet" href="/plugins/disk.activity/assets/wake-history.css?v=<?=$cssVersion?>">
 <script src="/plugins/disk.activity/assets/disk-activity-plus.js?v=<?=$jsVersion?>"></script>
@@ -81,7 +80,6 @@ $(function () {
   'use strict';
 
   var DAP = window.DiskActivityPlus;
-  var CSRF = <?=json_encode($csrf)?>;
 
   function confidenceBadge(value, evidence) {
     var state = String(value || 'unknown').toLowerCase();
@@ -215,14 +213,14 @@ $(function () {
       url: '/plugins/disk.activity/include/WakeActions.php',
       method: 'POST',
       dataType: 'json',
-      data: {csrf_token: CSRF, action: 'reset_history'},
+      data: {action: 'reset_history'},
       timeout: 5000
     }).done(function (response) {
       if (response && response.ok) poller.refresh();
       else alert('Reset failed.');
     }).fail(function (xhr) {
       var message = 'Reset failed.';
-      if (xhr && xhr.status === 403) message = 'Reset failed: invalid CSRF token. Refresh the page and try again.';
+      if (xhr && xhr.responseJSON && xhr.responseJSON.error) message += ' ' + xhr.responseJSON.error;
       alert(message);
     }).always(function () {
       button.prop('disabled', false);
