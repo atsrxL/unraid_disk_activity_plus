@@ -3,17 +3,31 @@ Title="Wake History"
 Icon="history"
 ---
 <?PHP
-$v = @filemtime('/usr/local/emhttp/plugins/disk.activity/assets/wake-history.css') ?: time();
+$cssVersion = @filemtime('/usr/local/emhttp/plugins/disk.activity/assets/wake-history.css') ?: time();
+$jsVersion = @filemtime('/usr/local/emhttp/plugins/disk.activity/assets/disk-activity-plus.js') ?: time();
 $csrf = $var['csrf_token'] ?? '';
 ?>
-<link type="text/css" rel="stylesheet" href="/plugins/disk.activity/assets/wake-history.css?v=<?=$v?>">
+<link type="text/css" rel="stylesheet" href="/plugins/disk.activity/assets/wake-history.css?v=<?=$cssVersion?>">
+<script src="/plugins/disk.activity/assets/disk-activity-plus.js?v=<?=$jsVersion?>"></script>
 
 <div id="wake-tracker-status" class="wake-status">Loading wake tracker…</div>
 <div class="wake-cards">
-  <div class="wake-card"><div class="wake-card-value" id="wake24">-</div><div class="wake-card-label">Wakes in last 24h</div></div>
-  <div class="wake-card"><div class="wake-card-value" id="wake7avg">-</div><div class="wake-card-label">7-day average / day</div></div>
-  <div class="wake-card"><div class="wake-card-value wake-card-actor" id="wakeTop">-</div><div class="wake-card-label">Top confirmed source (7d)</div></div>
-  <div class="wake-card"><div class="wake-card-value" id="wakeConfirmed">-</div><div class="wake-card-label">Confirmed attribution (7d)</div></div>
+  <div class="wake-card">
+    <div class="wake-card-value" id="wake24">-</div>
+    <div class="wake-card-label">Wakes in last 24h</div>
+  </div>
+  <div class="wake-card">
+    <div class="wake-card-value" id="wake7avg">-</div>
+    <div class="wake-card-label">7-day average / day</div>
+  </div>
+  <div class="wake-card">
+    <div class="wake-card-value wake-card-actor" id="wakeTop">-</div>
+    <div class="wake-card-label">Top confirmed source (7d)</div>
+  </div>
+  <div class="wake-card">
+    <div class="wake-card-value" id="wakeConfirmed">-</div>
+    <div class="wake-card-label">Confirmed attribution (7d)</div>
+  </div>
 </div>
 
 <div style="margin:12px 0 18px;">
@@ -22,49 +36,199 @@ $csrf = $var['csrf_token'] ?? '';
 </div>
 
 <h3>Disk summary</h3>
-<div class="wake-table-wrap"><table class="tablesorter wake-table" id="wake-disks">
-<thead><tr><th>Disk</th><th>State</th><th>24h wakes</th><th>7d wakes</th><th>7d avg/day</th><th>Top source</th><th>Share</th><th>Last wake</th></tr></thead><tbody></tbody>
-</table></div>
+<div class="wake-table-wrap">
+<table class="tablesorter wake-table" id="wake-disks">
+  <thead>
+    <tr><th>Disk</th><th>State</th><th>24h wakes</th><th>7d wakes</th><th>7d avg/day</th><th>Top source</th><th>Share</th><th>Last wake</th></tr>
+  </thead>
+  <tbody></tbody>
+</table>
+</div>
 
 <h3>Wake sources</h3>
-<p class="wake-help">Only <b>HIGH</b> fanotify-correlated events are credited to a named source. MEDIUM open-FD candidates remain visible in event history but are grouped as <b>unknown</b> for source/share statistics, preventing plausible-but-unproven processes from polluting the percentages.</p>
-<div class="wake-table-wrap"><table class="tablesorter wake-table" id="wake-sources">
-<thead><tr><th>Source</th><th>24h wakes</th><th>7d wakes</th><th>7d avg/day</th><th>7d wake share</th><th>Disks</th><th>Last wake</th></tr></thead><tbody></tbody>
-</table></div>
+<p class="wake-help">
+  Only <b>HIGH</b> events are credited to a named source. HIGH can come from a direct monitored-filesystem
+  fanotify event or a uniquely correlated Unraid <code>/mnt/user</code> event immediately before physical I/O.
+  MEDIUM open-FD candidates remain visible in event history but are grouped as <b>unknown</b> for source/share statistics.
+</p>
+<div class="wake-table-wrap">
+<table class="tablesorter wake-table" id="wake-sources">
+  <thead>
+    <tr><th>Source</th><th>24h wakes</th><th>7d wakes</th><th>7d avg/day</th><th>7d wake share</th><th>Disks</th><th>Last wake</th></tr>
+  </thead>
+  <tbody></tbody>
+</table>
+</div>
 
 <h3>Wake event history</h3>
-<p class="wake-help"><b>HIGH</b>: a file access from this PID was observed immediately before physical I/O. <b>MEDIUM</b>: exactly one process had a matching file/directory open at I/O onset. <b>UNKNOWN</b>: no safe attribution, or more than one open-FD candidate existed.</p>
-<div class="wake-table-wrap"><table class="tablesorter wake-table" id="wake-events">
-<thead><tr><th>Time</th><th>Disk</th><th>Source / possible source</th><th>PID</th><th>Operation</th><th>File</th><th>Confidence</th></tr></thead><tbody></tbody>
-</table></div>
+<p class="wake-help">
+  <b>HIGH</b>: a unique process access was observed immediately before physical I/O.
+  <b>MEDIUM</b>: exactly one process had a matching file/directory open at I/O onset.
+  <b>UNKNOWN</b>: no safe attribution, or more than one process was plausible.
+  History is automatically retained for up to 60 days / 5,000 events.
+</p>
+<div class="wake-table-wrap">
+<table class="tablesorter wake-table" id="wake-events">
+  <thead>
+    <tr><th>Time</th><th>Disk</th><th>Source / possible source</th><th>PID</th><th>Operation</th><th>File</th><th>Confidence</th></tr>
+  </thead>
+  <tbody></tbody>
+</table>
+</div>
 
 <script>
-$(function(){
+$(function () {
   'use strict';
-  var CSRF = <?=json_encode($csrf)?>, timer=null, req=null, stopped=false;
-  function esc(v){return $('<div>').text(v==null?'':String(v)).html();}
-  function when(ms){return ms?new Date(Number(ms)).toLocaleString():'-';}
-  function actor(e){var c=(e.container||'').trim(),p=(e.process||'unknown').trim();return c?c+(p&&p!==c?' ('+p+')':''):p;}
-  function badge(s){s=(s||'unknown').toLowerCase();return '<span class="wake-confidence wake-confidence-'+esc(s)+'">'+esc(s.toUpperCase())+'</span>';}
-  function stateBadge(s){s=(s||'unknown').toLowerCase();return '<span class="wake-state wake-state-'+esc(s)+'">'+esc(s.toUpperCase())+'</span>';}
-  function render(data){
-    var running=!!(data.state&&data.state.updated&&(Date.now()-Number(data.state.updated)<120000)),tracking=!!(data.state&&data.state.tracking);
-    $('#wake-tracker-status').attr('class','wake-status '+(running&&tracking?'wake-ok':'wake-warn')).text(running?(tracking?'Wake tracker running · '+(data.state.detector||'auto')+' detector · check every '+data.state.poll_seconds+'s':'Wake tracker running, attribution disabled'):'Wake tracker is not reporting. Check the Activity / Open Files tab and /var/log/disk_wake_monitor.log.');
-    var total24=0,total7=Number(data.total7d||0); Object.keys(data.disks||{}).forEach(function(k){total24+=Number(data.disks[k].count24h||0);});
-    $('#wake24').text(total24); $('#wake7avg').text((total7/7).toFixed(2)); $('#wakeConfirmed').text((data.confirmed_share7d||0)+'%');
-    var top='-'; (data.sources||[]).some(function(s){if(s.source&&s.source!=='unknown'&&Number(s.count7d)>0){top=s.source;return true;}return false;}); $('#wakeTop').text(top);
-    var sm={}; if(data.state&&Array.isArray(data.state.devices)) data.state.devices.forEach(function(d){sm[d.disk]=d.state;});
-    var rows=''; Object.keys(data.disks||{}).sort().forEach(function(k){var d=data.disks[k];rows+='<tr><td>'+esc(k)+(d.device?' <span class="wake-dev">('+esc(d.device)+')</span>':'')+'</td><td>'+stateBadge(sm[k])+'</td><td>'+esc(d.count24h)+'</td><td>'+esc(d.count7d)+'</td><td>'+esc(d.avg7d)+'</td><td>'+esc(d.top_actor||'-')+'</td><td>'+esc(d.top_share||0)+'%</td><td title="'+esc(d.last_path||'')+'">'+esc(when(d.last_ts))+'</td></tr>';});
-    if(!rows)rows='<tr><td colspan="8">No wake events recorded yet.</td></tr>'; $('#wake-disks tbody').html(rows);
-    rows=''; (data.sources||[]).forEach(function(s){rows+='<tr><td>'+esc(s.source||'unknown')+'</td><td>'+esc(s.count24h||0)+'</td><td>'+esc(s.count7d||0)+'</td><td>'+esc(s.avg7d||0)+'</td><td>'+esc(s.share7d||0)+'%</td><td>'+esc((s.disks||[]).join(', '))+'</td><td>'+esc(when(s.last_ts))+'</td></tr>';});
-    if(!rows)rows='<tr><td colspan="7">No wake sources recorded yet.</td></tr>'; $('#wake-sources tbody').html(rows);
-    rows=''; (data.events||[]).forEach(function(e){var a=actor(e),amb=Number(e.ambiguous_candidates||0);if((e.confidence||'').toLowerCase()==='unknown'&&amb>1)a='unknown ('+amb+' possible processes)';rows+='<tr><td class="wake-nowrap">'+esc(when(e.ts))+'</td><td>'+esc(e.disk||e.device||'-')+'</td><td>'+esc(a)+'</td><td>'+esc(e.pid||'-')+'</td><td>'+esc(e.event||'-')+'</td><td class="wake-path" title="'+esc(e.path||'')+'">'+esc(e.path||'-')+'</td><td>'+badge(e.confidence)+'</td></tr>';});
-    if(!rows)rows='<tr><td colspan="7">No wake events recorded yet. Let a monitored HDD spin down, then access a file on it.</td></tr>'; $('#wake-events tbody').html(rows);
+
+  var DAP = window.DiskActivityPlus;
+  var CSRF = <?=json_encode($csrf)?>;
+
+  function confidenceBadge(value, evidence) {
+    var state = String(value || 'unknown').toLowerCase();
+    var title = evidence ? ' title="' + DAP.escapeHtml(evidence) + '"' : '';
+    return '<span class="wake-confidence wake-confidence-' + DAP.escapeHtml(state) + '"' + title + '>' +
+      DAP.escapeHtml(state.toUpperCase()) + '</span>';
   }
-  function schedule(ms){if(!stopped){clearTimeout(timer);timer=setTimeout(refresh,ms);}}
-  function refresh(){if(stopped)return;if(document.hidden){schedule(5000);return;}if(req)return;req=$.ajax({url:'/plugins/disk.activity/include/WakeHistory.php?limit=500',dataType:'json',cache:false,timeout:3000}).done(render).fail(function(x,s){if(s!=='abort')$('#wake-tracker-status').attr('class','wake-status wake-warn').text('Unable to read wake tracker API.');}).always(function(){req=null;schedule(5000);});}
-  $('#wake-reset').on('click',function(){if(!confirm('Reset all recorded wake statistics and history?'))return;var b=$(this).prop('disabled',true);$.ajax({url:'/plugins/disk.activity/include/WakeActions.php',method:'POST',dataType:'json',data:{csrf_token:CSRF,action:'reset_history'},timeout:5000}).done(function(r){if(r&&r.ok)refresh();else alert('Reset failed.');}).fail(function(){alert('Reset failed.');}).always(function(){b.prop('disabled',false);});});
-  function stop(){stopped=true;clearTimeout(timer);if(req)req.abort();req=null;}
-  $(window).on('pagehide.diskWakeHistory beforeunload.diskWakeHistory',stop);$(document).on('visibilitychange.diskWakeHistory',function(){if(!document.hidden&&!req)schedule(0);});refresh();
+
+  function stateBadge(value) {
+    var state = String(value || 'unknown').toLowerCase();
+    return '<span class="wake-state wake-state-' + DAP.escapeHtml(state) + '">' +
+      DAP.escapeHtml(state.toUpperCase()) + '</span>';
+  }
+
+  function render(data) {
+    var running = !!(data.state && data.state.updated && (Date.now() - Number(data.state.updated) < 120000));
+    var tracking = !!(data.state && data.state.tracking);
+
+    var statusText;
+    if (!running) {
+      statusText = 'Wake tracker is not reporting. Check Open Files / Settings and /var/log/disk_wake_monitor.log.';
+    } else if (!tracking) {
+      statusText = 'Wake tracker running, attribution disabled';
+    } else {
+      statusText = 'Wake tracker running · ' + (data.state.detector || 'auto') +
+        ' detector · check every ' + data.state.poll_seconds + 's';
+    }
+    $('#wake-tracker-status')
+      .attr('class', 'wake-status ' + (running && tracking ? 'wake-ok' : 'wake-warn'))
+      .text(statusText);
+
+    var total24 = 0;
+    var total7 = Number(data.total7d || 0);
+    Object.keys(data.disks || {}).forEach(function (key) {
+      total24 += Number(data.disks[key].count24h || 0);
+    });
+
+    $('#wake24').text(total24);
+    $('#wake7avg').text((total7 / 7).toFixed(2));
+    $('#wakeConfirmed').text((data.confirmed_share7d || 0) + '%');
+
+    var top = '-';
+    (data.sources || []).some(function (source) {
+      if (source.source && source.source !== 'unknown' && Number(source.count7d) > 0) {
+        top = source.source;
+        return true;
+      }
+      return false;
+    });
+    $('#wakeTop').text(top);
+
+    var stateMap = {};
+    if (data.state && Array.isArray(data.state.devices)) {
+      data.state.devices.forEach(function (device) {
+        stateMap[device.disk] = device.state;
+      });
+    }
+
+    var rows = '';
+    Object.keys(data.disks || {}).sort().forEach(function (key) {
+      var disk = data.disks[key];
+      rows += '<tr>' +
+        '<td>' + DAP.escapeHtml(key) + (disk.device ? ' <span class="wake-dev">(' + DAP.escapeHtml(disk.device) + ')</span>' : '') + '</td>' +
+        '<td>' + stateBadge(stateMap[key]) + '</td>' +
+        '<td>' + DAP.escapeHtml(disk.count24h) + '</td>' +
+        '<td>' + DAP.escapeHtml(disk.count7d) + '</td>' +
+        '<td>' + DAP.escapeHtml(disk.avg7d) + '</td>' +
+        '<td>' + DAP.escapeHtml(disk.top_actor || '-') + '</td>' +
+        '<td>' + DAP.escapeHtml(disk.top_share || 0) + '%</td>' +
+        '<td title="' + DAP.escapeHtml(disk.last_path || '') + '">' + DAP.escapeHtml(DAP.formatTime(disk.last_ts)) + '</td>' +
+      '</tr>';
+    });
+    if (!rows) rows = '<tr><td colspan="8">No wake events recorded yet.</td></tr>';
+    $('#wake-disks tbody').html(rows);
+
+    rows = '';
+    (data.sources || []).forEach(function (source) {
+      rows += '<tr>' +
+        '<td>' + DAP.escapeHtml(source.source || 'unknown') + '</td>' +
+        '<td>' + DAP.escapeHtml(source.count24h || 0) + '</td>' +
+        '<td>' + DAP.escapeHtml(source.count7d || 0) + '</td>' +
+        '<td>' + DAP.escapeHtml(source.avg7d || 0) + '</td>' +
+        '<td>' + DAP.escapeHtml(source.share7d || 0) + '%</td>' +
+        '<td>' + DAP.escapeHtml((source.disks || []).join(', ')) + '</td>' +
+        '<td>' + DAP.escapeHtml(DAP.formatTime(source.last_ts)) + '</td>' +
+      '</tr>';
+    });
+    if (!rows) rows = '<tr><td colspan="7">No wake sources recorded yet.</td></tr>';
+    $('#wake-sources tbody').html(rows);
+
+    rows = '';
+    (data.events || []).forEach(function (event) {
+      var actor = DAP.actorLabel(event);
+      var ambiguous = Number(event.ambiguous_candidates || 0);
+      if (String(event.confidence || '').toLowerCase() === 'unknown' && ambiguous > 1) {
+        actor = 'unknown (' + ambiguous + ' possible processes)';
+      }
+      rows += '<tr>' +
+        '<td class="wake-nowrap">' + DAP.escapeHtml(DAP.formatTime(event.ts)) + '</td>' +
+        '<td>' + DAP.escapeHtml(event.disk || event.device || '-') + '</td>' +
+        '<td>' + DAP.escapeHtml(actor) + '</td>' +
+        '<td>' + DAP.escapeHtml(event.pid || '-') + '</td>' +
+        '<td>' + DAP.escapeHtml(event.event || '-') + '</td>' +
+        '<td class="wake-path" title="' + DAP.escapeHtml(event.path || '') + '">' + DAP.escapeHtml(event.path || '-') + '</td>' +
+        '<td>' + confidenceBadge(event.confidence, event.evidence) + '</td>' +
+      '</tr>';
+    });
+    if (!rows) {
+      rows = '<tr><td colspan="7">No wake events recorded yet. Let a monitored HDD spin down, then access a file on it.</td></tr>';
+    }
+    $('#wake-events tbody').html(rows);
+  }
+
+  var poller = DAP.createPoller({
+    url: '/plugins/disk.activity/include/WakeHistory.php?limit=500',
+    interval: 5000,
+    timeout: 3000,
+    onData: render,
+    onError: function () {
+      $('#wake-tracker-status')
+        .attr('class', 'wake-status wake-warn')
+        .text('Unable to read wake tracker API.');
+    }
+  });
+
+  $('#wake-reset').on('click', function () {
+    if (!confirm('Reset all recorded wake statistics and history?')) return;
+    var button = $(this).prop('disabled', true);
+
+    $.ajax({
+      url: '/plugins/disk.activity/include/WakeActions.php',
+      method: 'POST',
+      dataType: 'json',
+      data: {csrf_token: CSRF, action: 'reset_history'},
+      timeout: 5000
+    }).done(function (response) {
+      if (response && response.ok) poller.refresh();
+      else alert('Reset failed.');
+    }).fail(function (xhr) {
+      var message = 'Reset failed.';
+      if (xhr && xhr.status === 403) message = 'Reset failed: invalid CSRF token. Refresh the page and try again.';
+      alert(message);
+    }).always(function () {
+      button.prop('disabled', false);
+    });
+  });
+
+  poller.start();
 });
 </script>
