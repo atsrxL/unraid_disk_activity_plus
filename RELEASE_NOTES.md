@@ -9,3 +9,5 @@ This is a small usability follow-up to 2026.08.21.5.
 - This action only clears Disk Activity Plus diagnostic wake history; it does not modify Unraid configuration, storage data or user files.
 
 The stricter CSRF protection added in 2026.08.21.5 caused false token failures on some Unraid WebGUI page contexts and was disproportionate for a diagnostic-only reset action.
+
+<!-- release-build-trigger: 2026.08.21.6 -->
