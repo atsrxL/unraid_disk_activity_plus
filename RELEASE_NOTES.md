@@ -29,3 +29,5 @@ This release hardens the wake tracker and targets the largest remaining attribut
 - Keep `-Wall -Wextra -Werror` compilation in the release build.
 
 `/proc/diskstats` is still read in RAM by the wake monitor only to confirm the first real physical-I/O onset; the old Activity % sampler remains removed.
+
+<!-- release-build-trigger: 2026.08.21.5 -->
