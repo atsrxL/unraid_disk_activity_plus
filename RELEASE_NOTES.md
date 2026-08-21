@@ -1,15 +1,12 @@
-## Disk Activity Plus 2026.08.21.2
+## Disk Activity Plus 2026.08.21.3
 
-This hotfix corrects the blank Disk Activity Plus page introduced by the 2026.08.21.1 UI consolidation.
+This hotfix removes the legacy settings page that could remain installed after upgrading from earlier builds and cause a second Disk Activity icon under System/Other Settings.
 
 ### Fixed
-- Use Unraid's correct `Type="xmenu"` + `Tabs="true"` container for a single plugin entry with multiple child tabs.
-- Keep **Settings → User Utilities → Disk Activity Plus** as one icon while rendering **Activity / Open Files** and **Wake History** as tabs.
+- Explicitly remove `/usr/local/emhttp/plugins/disk.activity/DiskActivitySettings.page` before and after package upgrade.
+- Keep only **Settings → User Utilities → Disk Activity Plus** as the visible plugin entry.
+- Preserve the two tabs: **Activity / Open Files** and **Wake History**.
 
-### Included from 2026.08.21.1
-- Native sortable Dashboard tile showing files currently open on monitored HDD pools.
-- Reset button for wake statistics/history.
-- Conservative HIGH/MEDIUM/UNKNOWN wake attribution.
-- RAM-only `/proc` open-file snapshots with Docker/Podman attribution.
-- Bounded wake-history retention and RAM API caching.
-- Mounted-only ZFS dataset mapping and hardened immutable release pipeline.
+### Included from 2026.08.21.2
+- Correct Unraid `Type="xmenu"` + `Tabs="true"` tab container.
+- Native Dashboard open-files tile, wake history/reset, conservative attribution, RAM-only open-file snapshots and bounded history retention.
