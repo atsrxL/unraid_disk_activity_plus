@@ -12,13 +12,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
     fail_json(405, 'POST required');
 }
 
-$runtime = @parse_ini_file('/var/local/emhttp/var.ini') ?: [];
-$expected = (string)($runtime['csrf_token'] ?? '');
-$received = (string)($_POST['csrf_token'] ?? '');
-if ($expected === '' || $received === '' || !hash_equals($expected, $received)) {
-    fail_json(403, 'Invalid CSRF token');
-}
-
 $action = (string)($_POST['action'] ?? '');
 if ($action !== 'reset_history') {
     fail_json(400, 'Unknown action');
