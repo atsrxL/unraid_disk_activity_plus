@@ -1,6 +1,8 @@
 name: Publish Release
 on:
-  create:
+  push:
+    branches:
+      - 'release/**'
   workflow_dispatch:
     inputs:
       version:
@@ -11,7 +13,7 @@ permissions:
   contents: write
 jobs:
   release:
-    if: github.event_name == 'workflow_dispatch' || (github.ref_type == 'branch' && startsWith(github.ref_name, 'release/'))
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref_name, 'release/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

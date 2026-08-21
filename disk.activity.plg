@@ -21,7 +21,7 @@
 - Skip open-FD attribution work entirely when wake tracking is disabled
 - Add bounded wake-history retention (days + maximum events) and RAM API caching
 - Only map ZFS datasets that are actually mounted
-- Replace split C source fragments with one build-checked source file
+- Rebuild the native wake monitor from validated source fragments with -Werror checks
 - Harden release workflow: explicit version validation, immutable releases, and tag the exact build commit
 - Preserve previous WebGUI polling, quoted-disk, ZFS partition mapping and Docker attribution fixes
 
