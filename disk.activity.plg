@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "disk.activity">
   <!ENTITY author    "atsrxL / DerekChan65535">
-  <!ENTITY version   "2026.08.21.1">
+  <!ENTITY version   "2026.08.21.2">
   <!ENTITY launch    "Settings/DiskActivityPlus">
   <!ENTITY gitURL    "https://raw.githubusercontent.com/atsrxL/unraid_disk_activity_plus/main">
   <!ENTITY pluginURL "&gitURL;/disk.activity.plg">
@@ -11,6 +11,10 @@
 ]>
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="&support;" min="7.3.0" max="7.9.9">
 <CHANGES>
+###2026.08.21.2
+- Fix blank Disk Activity Plus page by using the correct Unraid xmenu tab container
+- Keep a single Settings > User Utilities entry with Activity / Open Files and Wake History tabs
+
 ###2026.08.21.1
 - Move plugin UI to Settings > User Utilities with one Disk Activity Plus entry and two tabs
 - Add Activity / Open Files tab and native sortable Dashboard tile for currently open HDD files
